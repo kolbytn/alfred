@@ -257,13 +257,13 @@ class Module(Base):
         '''
         pred = {}
         for ex, alow, alow_mask in zip(batch, feat['out_action_low'].max(2)[1].tolist(), feat['out_action_low_mask']):
-            # remove padding tokens
-            if self.pad in alow:
-                pad_start_idx = alow.index(self.pad)
-                alow = alow[:pad_start_idx]
-                alow_mask = alow_mask[:pad_start_idx]
 
             if clean_special_tokens:
+                # remove padding tokens
+                if self.pad in alow:
+                    pad_start_idx = alow.index(self.pad)
+                    alow = alow[:pad_start_idx]
+                    alow_mask = alow_mask[:pad_start_idx]
                 # remove <<stop>> tokens
                 if self.stop_token in alow:
                     stop_start_idx = alow.index(self.stop_token)

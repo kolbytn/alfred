@@ -4,10 +4,15 @@ import json
 import torch
 import pprint
 import collections
+from PIL import Image
 import numpy as np
 from torch import nn
 from tensorboardX import SummaryWriter
 from tqdm import trange
+
+from env.thor_env import ThorEnv
+from models.nn.resnet import Resnet
+
 
 class Module(nn.Module):
 
@@ -38,6 +43,10 @@ class Module(nn.Module):
 
         # summary self.writer
         self.summary_writer = None
+
+        # load resnet
+        args.visual_model = 'resnet18'
+        self.resnet = Resnet(args, eval=True, share_memory=True, use_conv_feat=True)
 
     def run_train(self, splits, args=None, optimizer=None):
         '''
@@ -77,13 +86,72 @@ class Module(nn.Module):
         # optimizer
         optimizer = optimizer or torch.optim.Adam(self.parameters(), lr=args.lr)
 
+        # environment
+        env = ThorEnv()
+
         # display dout
         print("Saving to: %s" % self.args.dout)
         best_loss = {'train': 1e10, 'valid_seen': 1e10, 'valid_unseen': 1e10}
         train_iter, valid_seen_iter, valid_unseen_iter = 0, 0, 0
         for epoch in trange(0, args.epoch, desc='epoch'):
-            m_train = collections.defaultdict(list)
             self.train()
+
+            ##################################################
+            ###           Reinforcement Learning           ###
+            ##################################################
+
+            # reset model
+            self.reset()
+
+            # setup scene
+            task = random.sample(train, 1)[0]
+            traj_data = self.load_task_json(task)
+            r_idx = task['repeat_idx']
+            self.setup_scene(env, traj_data, r_idx, args)
+
+            feat = self.featurize([traj_data], load_mask=False)
+            done = False
+            fails = 0
+            total_reward = 0
+            num_steps = 0
+            while not done and num_steps < args.max_steps:
+
+                # extract visual features
+                curr_image = Image.fromarray(np.uint8(env.last_event.frame))
+                feat['frames'] = self.resnet.featurize([curr_image], batch=1).unsqueeze(0)
+
+                # forward model
+                m_out = self.step(feat)
+                m_pred = self.extract_preds(m_out, [traj_data], feat, clean_special_tokens=False)
+                m_pred = list(m_pred.values())[0]
+
+                # check if <<stop>> was predicted
+                if m_pred['action_low'] == "<<stop>>":
+                    print("\tpredicted STOP")
+                    break
+
+                # get action and mask
+                action, mask = m_pred['action_low'], m_pred['action_low_mask'][0]
+                mask = np.squeeze(mask, axis=0) if self.has_interaction(action) else None
+
+                # use predicted action and mask (if available) to interact with the env
+                t_success, _, _, err, _ = env.va_interact(action, interact_mask=mask, smooth_nav=args.smooth_nav, debug=args.debug)
+                if not t_success:
+                    fails += 1
+                    if fails >= args.max_fails:
+                        print("Interact API failed %d times" % fails + "; latest error '%s'" % err)
+                        break
+
+                # next time-step
+                reward, done = env.get_transition_reward()
+                total_reward += reward
+                num_steps += 1
+
+            ##################################################
+            ###            Immitation Learning             ###
+            ##################################################
+
+            m_train = collections.defaultdict(list)
             self.adjust_lr(optimizer, args.lr, epoch, decay_epoch=args.decay_epoch)
             # p_train = {}
             total_train_loss = list()
@@ -109,6 +177,10 @@ class Module(nn.Module):
                 total_train_loss.append(float(sum_loss))
                 train_iter += self.args.batch
 
+            ##################################################
+            ###                 Validation                 ###
+            ##################################################
+
             ## compute metrics for train (too memory heavy!)
             # m_train = {k: sum(v) / len(v) for k, v in m_train.items()}
             # m_train.update(self.compute_metric(p_train, train))
@@ -126,6 +198,10 @@ class Module(nn.Module):
             m_valid_unseen.update(self.compute_metric(p_valid_unseen, valid_unseen))
             m_valid_unseen['total_loss'] = float(total_valid_unseen_loss)
             self.summary_writer.add_scalar('valid_unseen/total_loss', m_valid_unseen['total_loss'], valid_unseen_iter)
+
+            ##################################################
+            ###                   Logging                  ###
+            ##################################################
 
             stats = {'epoch': epoch,
                      'valid_seen': m_valid_seen,
@@ -332,3 +408,27 @@ class Module(nn.Module):
             return False
         else:
             return True
+
+    @classmethod
+    def setup_scene(cls, env, traj_data, r_idx, args, reward_type='dense'):
+        '''
+        intialize the scene and agent from the task info
+        '''
+        # scene setup
+        scene_num = traj_data['scene']['scene_num']
+        object_poses = traj_data['scene']['object_poses']
+        dirty_and_empty = traj_data['scene']['dirty_and_empty']
+        object_toggles = traj_data['scene']['object_toggles']
+
+        scene_name = 'FloorPlan%d' % scene_num
+        env.reset(scene_name)
+        env.restore_scene(object_poses, object_toggles, dirty_and_empty)
+
+        # initialize to start position
+        env.step(dict(traj_data['scene']['init_action']))
+
+        # print goal instr
+        print("Task: %s" % (traj_data['turk_annotations']['anns'][r_idx]['task_desc']))
+
+        # setup task for reward
+        env.set_task(traj_data, args, reward_type=reward_type)

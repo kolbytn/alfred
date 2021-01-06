@@ -539,14 +539,14 @@ class ThorEnv(Controller):
             # cv2 imshows to show image, segmentation mask, interact mask
             if debug:
                 print("action_box", "instance_ids", instance_ids)
-                instance_seg = copy.copy(instance_segs)
-                instance_seg[:, :, :] = interact_mask[:, :, np.newaxis] == 1
-                instance_seg *= 255
+                # instance_seg = copy.copy(instance_segs)
+                # instance_seg[:, :, :] = interact_mask[:, :, np.newaxis] == 1
+                # instance_seg *= 255
 
-                cv2.imshow('seg', instance_segs)
-                cv2.imshow('mask', instance_seg)
-                cv2.imshow('full', self.last_event.frame[:,:,::-1])
-                cv2.waitKey(0)
+                # cv2.imshow('seg', instance_segs)
+                # cv2.imshow('mask', instance_seg)
+                # cv2.imshow('full', self.last_event.frame[:,:,::-1])
+                # cv2.waitKey(0)
 
             if len(instance_ids) == 0:
                 err = "Bad interact mask. Couldn't locate target object"
@@ -569,12 +569,12 @@ class ThorEnv(Controller):
             if interact_mask is not None and debug:
                 print("Failed to execute action!", action, target_instance_id)
                 print("all_ids inside BBox: " + str(all_ids))
-                instance_seg = copy.copy(instance_segs)
-                instance_seg[:, :, :] = interact_mask[:, :, np.newaxis] == 1
-                cv2.imshow('seg', instance_segs)
-                cv2.imshow('mask', instance_seg)
-                cv2.imshow('full', self.last_event.frame[:,:,::-1])
-                cv2.waitKey(0)
+                # instance_seg = copy.copy(instance_segs)
+                # instance_seg[:, :, :] = interact_mask[:, :, np.newaxis] == 1
+                # cv2.imshow('seg', instance_segs)
+                # cv2.imshow('mask', instance_seg)
+                # cv2.imshow('full', self.last_event.frame[:,:,::-1])
+                # cv2.waitKey(0)
                 print(event.metadata['errorMessage'])
             success = False
             return success, event, target_instance_id, event.metadata['errorMessage'], api_action
