@@ -343,6 +343,10 @@ class Module(Base):
         return losses
 
 
+    def rl_update(self, rollouts):
+        pass
+
+
     def weighted_mask_loss(self, pred_masks, gt_masks):
         '''
         mask loss that accounts for weight-imbalance between 0 and 1 pixels

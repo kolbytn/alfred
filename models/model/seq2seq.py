@@ -100,52 +100,70 @@ class Module(nn.Module):
             ###           Reinforcement Learning           ###
             ##################################################
 
-            # reset model
-            self.reset()
+            rollouts = []
+            for _ in range(args.episodes_per_epoch):
 
-            # setup scene
-            task = random.sample(train, 1)[0]
-            traj_data = self.load_task_json(task)
-            r_idx = task['repeat_idx']
-            self.setup_scene(env, traj_data, r_idx, args)
+                # reset model
+                self.reset()
 
-            feat = self.featurize([traj_data], load_mask=False)
-            done = False
-            fails = 0
-            total_reward = 0
-            num_steps = 0
-            while not done and num_steps < args.max_steps:
+                # setup scene
+                task = random.sample(train, 1)[0]
+                traj_data = self.load_task_json(task)
+                r_idx = task['repeat_idx']
+                self.setup_scene(env, traj_data, r_idx, args)
 
-                # extract visual features
-                curr_image = Image.fromarray(np.uint8(env.last_event.frame))
-                feat['frames'] = self.resnet.featurize([curr_image], batch=1).unsqueeze(0)
+                feat = self.featurize([traj_data], load_frames=False, load_mask=False)
 
-                # forward model
-                m_out = self.step(feat)
-                m_pred = self.extract_preds(m_out, [traj_data], feat, clean_special_tokens=False)
-                m_pred = list(m_pred.values())[0]
+                curr_rollout = []
+                done = False
+                fails = 0
+                total_reward = 0
+                num_steps = 0
+                while not done and num_steps < args.max_steps:
 
-                # check if <<stop>> was predicted
-                if m_pred['action_low'] == "<<stop>>":
-                    print("\tpredicted STOP")
-                    break
+                    # extract visual features
+                    curr_image = Image.fromarray(np.uint8(env.last_event.frame))
+                    feat['frames'] = self.resnet.featurize([curr_image], batch=1).unsqueeze(0)
 
-                # get action and mask
-                action, mask = m_pred['action_low'], m_pred['action_low_mask'][0]
-                mask = np.squeeze(mask, axis=0) if self.has_interaction(action) else None
+                    # forward model
+                    m_out = self.step(feat)
+                    m_pred = self.extract_preds(m_out, [traj_data], feat, clean_special_tokens=False)
+                    m_pred = list(m_pred.values())[0]
 
-                # use predicted action and mask (if available) to interact with the env
-                t_success, _, _, err, _ = env.va_interact(action, interact_mask=mask, smooth_nav=args.smooth_nav, debug=args.debug)
-                if not t_success:
-                    fails += 1
-                    if fails >= args.max_fails:
-                        print("Interact API failed %d times" % fails + "; latest error '%s'" % err)
-                        break
+                    # # check if <<stop>> was predicted
+                    # if m_pred['action_low'] == "<<stop>>":
+                    #     print("\tpredicted STOP")
+                    #     break
 
-                # next time-step
-                reward, done = env.get_transition_reward()
-                total_reward += reward
-                num_steps += 1
+                    # get action and mask
+                    action, mask = m_pred['action_low'], m_pred['action_low_mask'][0]
+                    mask = np.squeeze(mask, axis=0) if self.has_interaction(action) else None
+
+                    # use predicted action and mask (if available) to interact with the env
+                    t_success, _, _, err, _ = env.va_interact(action, interact_mask=mask, smooth_nav=args.smooth_nav, debug=args.debug)
+
+                    # if not t_success:
+                    #     fails += 1
+                    #     if fails >= args.max_fails:
+                    #         print("Interact API failed %d times" % fails + "; latest error '%s'" % err)
+                    #         break
+
+                    # next time-step
+                    reward, done = env.get_transition_reward()
+                    total_reward += reward
+                    num_steps += 1
+
+                    curr_rollout.append({
+                        'frames': feat['frames'],
+                        'out_action_low': feat['out_action_low'],
+                        'out_action_low_mask': feat['out_action_low_mask'],
+                        'action_low': action,
+                        'action_low_mask': mask
+                    })
+                rollouts.append(curr_rollout)
+            
+            if len(rollouts) > 0:
+                self.rl_update(rollouts)
 
             ##################################################
             ###            Immitation Learning             ###
@@ -156,7 +174,9 @@ class Module(nn.Module):
             # p_train = {}
             total_train_loss = list()
             random.shuffle(train) # shuffle every epoch
-            for batch, feat in self.iterate(train, args.batch):
+            sampled_train = train[:args.batch * args.batches_per_epoch] if args.batch * args.batches_per_epoch < len(train) else train
+
+            for batch, feat in self.iterate(sampled_train, args.batch):
                 out = self.forward(feat)
                 preds = self.extract_preds(out, batch, feat)
                 # p_train.update(preds)
@@ -314,6 +334,9 @@ class Module(nn.Module):
         raise NotImplementedError()
 
     def compute_metric(self, preds, data):
+        raise NotImplementedError()
+
+    def rl_update(self, rollouts):
         raise NotImplementedError()
 
     def get_task_and_ann_id(self, ex):

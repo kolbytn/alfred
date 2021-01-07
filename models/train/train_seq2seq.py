@@ -1,6 +1,7 @@
 import os
 import sys
 sys.path.append(os.path.join(os.environ['ALFRED_ROOT']))
+sys.path.append(os.path.join(os.environ['ALFRED_ROOT'], 'gen'))
 sys.path.append(os.path.join(os.environ['ALFRED_ROOT'], 'models'))
 
 import os
@@ -20,11 +21,11 @@ if __name__ == '__main__':
     # settings
     parser.add_argument('--seed', help='random seed', default=123, type=int)
     parser.add_argument('--data', help='dataset folder', default='data/json_feat_2.1.0')
-    parser.add_argument('--splits', help='json file containing train/dev/test splits', default='splits/oct21.json')
+    parser.add_argument('--splits', help='json file containing train/dev/test splits', default='data/splits/oct21.json')
     parser.add_argument('--preprocess', help='store preprocessed data to json files', action='store_true')
     parser.add_argument('--pp_folder', help='folder name for preprocessed data', default='pp')
     parser.add_argument('--save_every_epoch', help='save model after every epoch (warning: consumes a lot of space)', action='store_true')
-    parser.add_argument('--model', help='model to use', default='seq2seq_im')
+    parser.add_argument('--model', help='model to use', default='seq2seq_im_mask')
     parser.add_argument('--gpu', help='use gpu', action='store_true')
     parser.add_argument('--dout', help='where to save model', default='exp/model:{model}')
     parser.add_argument('--use_templated_goals', help='use templated goals instead of human-annotated goal descriptions', action='store_true')
@@ -44,6 +45,16 @@ if __name__ == '__main__':
     parser.add_argument('--subgoal_aux_loss_wt', help='weight of subgoal completion predictor', default=0., type=float)
     parser.add_argument('--pm_aux_loss_wt', help='weight of progress monitor', default=0., type=float)
 
+    # rl settings
+    parser.add_argument('--reward_config', default='models/config/rewards.json')
+    parser.add_argument('--smooth_nav', dest='smooth_nav', action='store_true', help='smooth nav actions (might be required based on training data)')
+
+    # rl parameters
+    parser.add_argument('--max_steps', type=int, default=100, help='max steps before episode termination')
+    parser.add_argument('--max_fails', type=int, default=10, help='max API execution failures before episode termination')
+    parser.add_argument('--episodes_per_epoch', type=int, default=0, help='number of episodes to gather each epoch for reinforcement learning')
+    parser.add_argument('--batches_per_epoch', type=int, default=float('inf'), help='max number of immitation learning batches for each epoch')
+
     # dropouts
     parser.add_argument('--zero_goal', help='zero out goal language', action='store_true')
     parser.add_argument('--zero_instr', help='zero out step-by-step instr language', action='store_true')
@@ -59,6 +70,7 @@ if __name__ == '__main__':
     parser.add_argument('--temp_no_history', help='use gpu', action='store_true')
 
     # debugging
+    parser.add_argument('--debug', dest='debug', action='store_true')
     parser.add_argument('--fast_epoch', help='fast epoch during debugging', action='store_true')
     parser.add_argument('--dataset_fraction', help='use fraction of the dataset for debugging (0 indicates full size)', default=0, type=int)
     

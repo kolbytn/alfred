@@ -31,10 +31,6 @@ if __name__ == '__main__':
     parser.add_argument('--use_templated_goals', help='use templated goals instead of human-annotated goal descriptions', action='store_true')
     parser.add_argument('--resume', help='load a checkpoint')
 
-    # rl settings
-    parser.add_argument('--reward_config', default='models/config/rewards.json')
-    parser.add_argument('--smooth_nav', dest='smooth_nav', action='store_true', help='smooth nav actions (might be required based on training data)')
-
     # hyper parameters
     parser.add_argument('--batch', help='batch size', default=8, type=int)
     parser.add_argument('--epoch', help='number of epochs', default=20, type=int)
@@ -49,9 +45,15 @@ if __name__ == '__main__':
     parser.add_argument('--subgoal_aux_loss_wt', help='weight of subgoal completion predictor', default=0., type=float)
     parser.add_argument('--pm_aux_loss_wt', help='weight of progress monitor', default=0., type=float)
 
+    # rl settings
+    parser.add_argument('--reward_config', default='models/config/rewards.json')
+    parser.add_argument('--smooth_nav', dest='smooth_nav', action='store_true', help='smooth nav actions (might be required based on training data)')
+
     # rl parameters
     parser.add_argument('--max_steps', type=int, default=100, help='max steps before episode termination')
     parser.add_argument('--max_fails', type=int, default=10, help='max API execution failures before episode termination')
+    parser.add_argument('--episodes_per_epoch', type=int, default=1, help='number of episodes to gather each epoch for reinforcement learning')
+    parser.add_argument('--batches_per_epoch', type=int, default=1, help='max number of immitation learning batches for each epoch')
 
     # dropouts
     parser.add_argument('--zero_goal', help='zero out goal language', action='store_true')
