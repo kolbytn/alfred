@@ -9,9 +9,58 @@ import numpy as np
 from torch import nn
 from tensorboardX import SummaryWriter
 from tqdm import trange
+import time
 
 from env.thor_env import ThorEnv
 from models.nn.resnet import Resnet
+
+
+
+# video recorder helper class
+from datetime import datetime
+import cv2
+class VideoRecord:
+    def __init__(self, path, name, fps=5):
+        """
+        param:
+            path: video save path (str)
+            name: video name (str)
+            fps: frames per second (int) (default=5)
+        example usage:
+            rec = VideoRecord('path/to/', 'filename', 10)
+        """
+        self.path = path
+        self.name = name
+        self.fps = fps
+        self.frames = []
+    def record_frame(self, env_frame):
+        """
+            records video frame in this object
+        param:
+            env_frame: a frame from thor environment (ThorEnv().last_event.frame)
+        example usage:
+            env = Thorenv()
+            lastframe = env.last_event.frame
+            rec.record_frame(lastframes)
+        """
+        curr_image = Image.fromarray(np.uint8(env_frame))
+        img = cv2.cvtColor(np.asarray(curr_image), cv2.COLOR_RGB2BGR)
+        self.frames.append(img)
+    def savemp4(self):
+        """
+            writes video to file at specified location, finalize video file
+        example usage:
+            rec.savemp4()
+        """
+        if len(self.frames) == 0:
+            raise Exception("Can't write video file with no frames recorded")
+        height, width, layers = self.frames[0].shape
+        size = (width,height)
+        out = cv2.VideoWriter(f"{self.path}{self.name}.mp4", 0x7634706d, self.fps, size)
+        for i in range(len(self.frames)):
+            out.write(self.frames[i])
+        out.release()
+
 
 
 class Module(nn.Module):
@@ -212,7 +261,7 @@ class Module(nn.Module):
             ###                 Validation                 ###
             ##################################################
 
-            # print("==========================VALIDATION==========================")
+            print("==========================VALIDATION==========================")
             # # NOTE: Original Implementation: predict action and compute loss
             # # compute metrics for train (too memory heavy!)
             # m_train = {k: sum(v) / len(v) for k, v in m_train.items()}
@@ -241,7 +290,7 @@ class Module(nn.Module):
             print(sampled)
             total_rewards = [] # 1st half: seen, 2nd half: unseen
             
-            for task in sampled:
+            for i, task in enumerate(sampled):
 
                 # reset model
                 self.reset()
@@ -249,6 +298,8 @@ class Module(nn.Module):
                 # setup scene
                 traj_data = self.load_task_json(task)
                 r_idx = task['repeat_idx']
+                
+
                 self.setup_scene(env, traj_data, r_idx, args)
 
                 feat = self.featurize([traj_data], load_frames=False, load_mask=False)
@@ -257,11 +308,20 @@ class Module(nn.Module):
                 fails = 0
                 total_reward = 0
                 num_steps = 0
+
+                # initialize video recording
+                task_name = '_'.join(('_'.join(str(datetime.now()).split(':')) + '_' + task['task']).split('/'))
+                print("video recording: (", task_name, ") created at:", args.video_output_path)
+                video_recording = VideoRecord(args.video_output_path, task_name, args.video_fps)
+
                 while not done and num_steps < args.max_steps:
 
                     # extract visual features
                     curr_image = Image.fromarray(np.uint8(env.last_event.frame))
                     feat['frames'] = self.resnet.featurize([curr_image], batch=1).unsqueeze(0)
+
+                    # record video using last observation
+                    video_recording.record_frame(env.last_event.frame)
 
                     # forward model
                     m_out = self.step(feat)
@@ -292,6 +352,7 @@ class Module(nn.Module):
                     num_steps += 1
                 
                 total_rewards.append(total_reward)
+                video_recording.savemp4()
             
             mean_valid_seen_reward = sum(total_rewards[:(len(total_rewards)//2)]) / (len(total_rewards) // 2)
             mean_valid_unseen_reward = sum(total_rewards[(len(total_rewards)//2):]) / (len(total_rewards) // 2)
