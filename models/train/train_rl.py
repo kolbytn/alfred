@@ -54,6 +54,8 @@ if __name__ == '__main__':
     parser.add_argument('--max_fails', type=int, default=10, help='max API execution failures before episode termination')
     parser.add_argument('--episodes_per_epoch', type=int, default=1, help='number of episodes to gather each epoch for reinforcement learning')
     parser.add_argument('--batches_per_epoch', type=int, default=1, help='max number of immitation learning batches for each epoch')
+    parser.add_argument('--validation_frequency', type=int, default=10, help='frequency of doing validation during training')
+    parser.add_argument('--validation_episodes', type=int, default=20, help='number of episodes per validation')
 
     # dropouts
     parser.add_argument('--zero_goal', help='zero out goal language', action='store_true')

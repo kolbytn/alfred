@@ -91,14 +91,23 @@ class Module(nn.Module):
 
         # display dout
         print("Saving to: %s" % self.args.dout)
-        best_loss = {'train': 1e10, 'valid_seen': 1e10, 'valid_unseen': 1e10}
+        # best_loss = {'train': 1e10, 'valid_seen': 1e10, 'valid_unseen': 1e10}
+        mean_reward = {'train': 0, 'valid_seen': 0, 'valid_unseen': 0}
+
         train_iter, valid_seen_iter, valid_unseen_iter = 0, 0, 0
+        mean_valid_seen_reward = None
+        mean_valid_unseen_reward = None
+
+
+
+        
         for epoch in trange(0, args.epoch, desc='epoch'):
             self.train()
 
             ##################################################
             ###           Reinforcement Learning           ###
             ##################################################
+            # print("==========================REINFORCEMENT LEARNING==========================")
 
             rollouts = []
             for _ in range(args.episodes_per_epoch):
@@ -169,6 +178,8 @@ class Module(nn.Module):
             ###            Immitation Learning             ###
             ##################################################
 
+            # print("==========================IMITATION LEARNING==========================")
+
             m_train = collections.defaultdict(list)
             self.adjust_lr(optimizer, args.lr, epoch, decay_epoch=args.decay_epoch)
             # p_train = {}
@@ -201,34 +212,103 @@ class Module(nn.Module):
             ###                 Validation                 ###
             ##################################################
 
-            ## compute metrics for train (too memory heavy!)
+            # print("==========================VALIDATION==========================")
+            # # NOTE: Original Implementation: predict action and compute loss
+            # # compute metrics for train (too memory heavy!)
             # m_train = {k: sum(v) / len(v) for k, v in m_train.items()}
             # m_train.update(self.compute_metric(p_train, train))
             # m_train['total_loss'] = sum(total_train_loss) / len(total_train_loss)
             # self.summary_writer.add_scalar('train/total_loss', m_train['total_loss'], train_iter)
 
-            # compute metrics for valid_seen
-            p_valid_seen, valid_seen_iter, total_valid_seen_loss, m_valid_seen = self.run_pred(valid_seen, args=args, name='valid_seen', iter=valid_seen_iter)
-            m_valid_seen.update(self.compute_metric(p_valid_seen, valid_seen))
-            m_valid_seen['total_loss'] = float(total_valid_seen_loss)
-            self.summary_writer.add_scalar('valid_seen/total_loss', m_valid_seen['total_loss'], valid_seen_iter)
+            # # compute metrics for valid_seen
+            # p_valid_seen, valid_seen_iter, total_valid_seen_loss, m_valid_seen = self.run_pred(valid_seen, args=args, name='valid_seen', iter=valid_seen_iter)
+            # m_valid_seen.update(self.compute_metric(p_valid_seen, valid_seen))
+            # m_valid_seen['total_loss'] = float(total_valid_seen_loss)
+            # self.summary_writer.add_scalar('valid_seen/total_loss', m_valid_seen['total_loss'], valid_seen_iter)
 
-            # compute metrics for valid_unseen
-            p_valid_unseen, valid_unseen_iter, total_valid_unseen_loss, m_valid_unseen = self.run_pred(valid_unseen, args=args, name='valid_unseen', iter=valid_unseen_iter)
-            m_valid_unseen.update(self.compute_metric(p_valid_unseen, valid_unseen))
-            m_valid_unseen['total_loss'] = float(total_valid_unseen_loss)
-            self.summary_writer.add_scalar('valid_unseen/total_loss', m_valid_unseen['total_loss'], valid_unseen_iter)
+            # # compute metrics for valid_unseen
+            # p_valid_unseen, valid_unseen_iter, total_valid_unseen_loss, m_valid_unseen = self.run_pred(valid_unseen, args=args, name='valid_unseen', iter=valid_unseen_iter)
+            # m_valid_unseen.update(self.compute_metric(p_valid_unseen, valid_unseen))
+            # m_valid_unseen['total_loss'] = float(total_valid_unseen_loss)
+            # self.summary_writer.add_scalar('valid_unseen/total_loss', m_valid_unseen['total_loss'], valid_unseen_iter)
 
+
+            # # NOTE: RL implementation: rollout and record trajectory
+            # if (epoch + 1) % args.validation_frequency == 0:
+                
+            sampled = random.sample(valid_seen, args.validation_episodes // 2)              # seen envs
+            sampled.extend(random.sample(valid_unseen, args.validation_episodes // 2))      # unseen envs
+            print(sampled)
+            total_rewards = [] # 1st half: seen, 2nd half: unseen
+            
+            for task in sampled:
+
+                # reset model
+                self.reset()
+
+                # setup scene
+                traj_data = self.load_task_json(task)
+                r_idx = task['repeat_idx']
+                self.setup_scene(env, traj_data, r_idx, args)
+
+                feat = self.featurize([traj_data], load_frames=False, load_mask=False)
+
+                done = False
+                fails = 0
+                total_reward = 0
+                num_steps = 0
+                while not done and num_steps < args.max_steps:
+
+                    # extract visual features
+                    curr_image = Image.fromarray(np.uint8(env.last_event.frame))
+                    feat['frames'] = self.resnet.featurize([curr_image], batch=1).unsqueeze(0)
+
+                    # forward model
+                    m_out = self.step(feat)
+                    m_pred = self.extract_preds(m_out, [traj_data], feat, clean_special_tokens=False)
+                    m_pred = list(m_pred.values())[0]
+
+                    # # check if <<stop>> was predicted
+                    # if m_pred['action_low'] == "<<stop>>":
+                    #     print("\tpredicted STOP")
+                    #     break
+
+                    # get action and mask
+                    action, mask = m_pred['action_low'], m_pred['action_low_mask'][0]
+                    mask = np.squeeze(mask, axis=0) if self.has_interaction(action) else None
+
+                    # use predicted action and mask (if available) to interact with the env
+                    t_success, _, _, err, _ = env.va_interact(action, interact_mask=mask, smooth_nav=args.smooth_nav, debug=args.debug)
+
+                    # if not t_success:
+                    #     fails += 1
+                    #     if fails >= args.max_fails:
+                    #         print("Interact API failed %d times" % fails + "; latest error '%s'" % err)
+                    #         break
+
+                    # next time-step
+                    reward, done = env.get_transition_reward()
+                    total_reward += reward
+                    num_steps += 1
+                
+                total_rewards.append(total_reward)
+            
+            mean_valid_seen_reward = sum(total_rewards[:(len(total_rewards)//2)]) / (len(total_rewards) // 2)
+            mean_valid_unseen_reward = sum(total_rewards[(len(total_rewards)//2):]) / (len(total_rewards) // 2)
+            
             ##################################################
             ###                   Logging                  ###
             ##################################################
 
-            stats = {'epoch': epoch,
-                     'valid_seen': m_valid_seen,
-                     'valid_unseen': m_valid_unseen}
+            # print("==========================LOGGING==========================")
 
+            stats = {'epoch': epoch,
+                     'valid_seen': (mean_valid_seen_reward),
+                     'valid_unseen': (mean_valid_unseen_reward)}
+
+            # check reward if better then save
             # new best valid_seen loss
-            if total_valid_seen_loss < best_loss['valid_seen']:
+            if mean_valid_seen_reward is not None and mean_valid_seen_reward > mean_reward['valid_seen']:
                 print('\nFound new best valid_seen!! Saving...')
                 fsave = os.path.join(args.dout, 'best_seen.pth')
                 torch.save({
@@ -242,13 +322,13 @@ class Module(nn.Module):
                 with open(fbest, 'wt') as f:
                     json.dump(stats, f, indent=2)
 
-                fpred = os.path.join(args.dout, 'valid_seen.debug.preds.json')
-                with open(fpred, 'wt') as f:
-                    json.dump(self.make_debug(p_valid_seen, valid_seen), f, indent=2)
-                best_loss['valid_seen'] = total_valid_seen_loss
+                # fpred = os.path.join(args.dout, 'valid_seen.debug.preds.json')
+                # with open(fpred, 'wt') as f:
+                #     json.dump(self.make_debug(p_valid_seen, valid_seen), f, indent=2)
+                mean_reward['valid_seen'] = mean_valid_seen_reward
 
             # new best valid_unseen loss
-            if total_valid_unseen_loss < best_loss['valid_unseen']:
+            if mean_valid_unseen_reward is not None and mean_valid_unseen_reward < mean_reward['valid_unseen']:
                 print('Found new best valid_unseen!! Saving...')
                 fsave = os.path.join(args.dout, 'best_unseen.pth')
                 torch.save({
@@ -262,11 +342,12 @@ class Module(nn.Module):
                 with open(fbest, 'wt') as f:
                     json.dump(stats, f, indent=2)
 
-                fpred = os.path.join(args.dout, 'valid_unseen.debug.preds.json')
-                with open(fpred, 'wt') as f:
-                    json.dump(self.make_debug(p_valid_unseen, valid_unseen), f, indent=2)
+                # fpred = os.path.join(args.dout, 'valid_unseen.debug.preds.json')
+                # with open(fpred, 'wt') as f:
+                #     json.dump(self.make_debug(p_valid_unseen, valid_unseen), f, indent=2)
+                mean_reward['valid_unseen'] = mean_valid_unseen_reward
 
-                best_loss['valid_unseen'] = total_valid_unseen_loss
+
 
             # save the latest checkpoint
             if args.save_every_epoch:
