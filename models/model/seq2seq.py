@@ -261,7 +261,6 @@ class Module(nn.Module):
             ###                 Validation                 ###
             ##################################################
 
-            print("==========================VALIDATION==========================")
             # # NOTE: Original Implementation: predict action and compute loss
             # # compute metrics for train (too memory heavy!)
             # m_train = {k: sum(v) / len(v) for k, v in m_train.items()}
@@ -283,95 +282,140 @@ class Module(nn.Module):
 
 
             # # NOTE: RL implementation: rollout and record trajectory
-            # if (epoch + 1) % args.validation_frequency == 0:
+            if (epoch + 1) % args.validation_frequency == 0:
+                print("==========================VALIDATION==========================")
                 
-            sampled = random.sample(valid_seen, args.validation_episodes // 2)              # seen envs
-            sampled.extend(random.sample(valid_unseen, args.validation_episodes // 2))      # unseen envs
-            print(sampled)
-            total_rewards = [] # 1st half: seen, 2nd half: unseen
-            
-            for i, task in enumerate(sampled):
-
-                # reset model
-                self.reset()
-
-                # setup scene
-                traj_data = self.load_task_json(task)
-                r_idx = task['repeat_idx']
+                # sampled = random.sample(valid_seen, args.validation_episodes // 2)              # seen envs
+                # sampled.extend(random.sample(valid_unseen, args.validation_episodes // 2))      # unseen envs
+                sampled = valid_seen + valid_unseen
+                print(sampled)
+                total_rewards = [] # 1st half: seen, 2nd half: unseen
                 
+                for i, task in enumerate(sampled):
 
-                self.setup_scene(env, traj_data, r_idx, args)
+                    # reset model
+                    self.reset()
 
-                feat = self.featurize([traj_data], load_frames=False, load_mask=False)
+                    # setup scene
+                    traj_data = self.load_task_json(task)
+                    r_idx = task['repeat_idx']
+                    
 
-                done = False
-                fails = 0
-                total_reward = 0
-                num_steps = 0
+                    self.setup_scene(env, traj_data, r_idx, args)
 
-                # initialize video recording
-                task_name = '_'.join(('_'.join(str(datetime.now()).split(':')) + '_' + task['task']).split('/'))
-                print("video recording: (", task_name, ") created at:", args.video_output_path)
-                video_recording = VideoRecord(args.video_output_path, task_name, args.video_fps)
+                    feat = self.featurize([traj_data], load_frames=False, load_mask=False)
 
-                while not done and num_steps < args.max_steps:
+                    done = False
+                    fails = 0
+                    total_reward = 0
+                    num_steps = 0
 
-                    # extract visual features
-                    curr_image = Image.fromarray(np.uint8(env.last_event.frame))
-                    feat['frames'] = self.resnet.featurize([curr_image], batch=1).unsqueeze(0)
+                    # initialize video recording
+                    task_name = '_'.join(('_'.join(str(datetime.now()).split(':')) + '_' + task['task']).split('/'))
+                    print("video recording: (", task_name, ") created at:", args.video_output_path)
+                    video_recording = VideoRecord(args.video_output_path, task_name, args.video_fps)
 
-                    # record video using last observation
-                    video_recording.record_frame(env.last_event.frame)
+                    while not done and num_steps < args.max_steps:
 
-                    # forward model
-                    m_out = self.step(feat)
-                    m_pred = self.extract_preds(m_out, [traj_data], feat, clean_special_tokens=False)
-                    m_pred = list(m_pred.values())[0]
+                        # extract visual features
+                        curr_image = Image.fromarray(np.uint8(env.last_event.frame))
+                        feat['frames'] = self.resnet.featurize([curr_image], batch=1).unsqueeze(0)
 
-                    # # check if <<stop>> was predicted
-                    # if m_pred['action_low'] == "<<stop>>":
-                    #     print("\tpredicted STOP")
-                    #     break
+                        # record video using last observation
+                        video_recording.record_frame(env.last_event.frame)
 
-                    # get action and mask
-                    action, mask = m_pred['action_low'], m_pred['action_low_mask'][0]
-                    mask = np.squeeze(mask, axis=0) if self.has_interaction(action) else None
+                        # forward model
+                        m_out = self.step(feat)
+                        m_pred = self.extract_preds(m_out, [traj_data], feat, clean_special_tokens=False)
+                        m_pred = list(m_pred.values())[0]
 
-                    # use predicted action and mask (if available) to interact with the env
-                    t_success, _, _, err, _ = env.va_interact(action, interact_mask=mask, smooth_nav=args.smooth_nav, debug=args.debug)
+                        # # check if <<stop>> was predicted
+                        # if m_pred['action_low'] == "<<stop>>":
+                        #     print("\tpredicted STOP")
+                        #     break
 
-                    # if not t_success:
-                    #     fails += 1
-                    #     if fails >= args.max_fails:
-                    #         print("Interact API failed %d times" % fails + "; latest error '%s'" % err)
-                    #         break
+                        # get action and mask
+                        action, mask = m_pred['action_low'], m_pred['action_low_mask'][0]
+                        mask = np.squeeze(mask, axis=0) if self.has_interaction(action) else None
 
-                    # next time-step
-                    reward, done = env.get_transition_reward()
-                    total_reward += reward
-                    num_steps += 1
+                        # use predicted action and mask (if available) to interact with the env
+                        t_success, _, _, err, _ = env.va_interact(action, interact_mask=mask, smooth_nav=args.smooth_nav, debug=args.debug)
+
+                        # if not t_success:
+                        #     fails += 1
+                        #     if fails >= args.max_fails:
+                        #         print("Interact API failed %d times" % fails + "; latest error '%s'" % err)
+                        #         break
+
+                        # next time-step
+                        reward, done = env.get_transition_reward()
+                        total_reward += reward
+                        num_steps += 1
+                    
+                    total_rewards.append(total_reward)
+                    video_recording.savemp4()
                 
-                total_rewards.append(total_reward)
-                video_recording.savemp4()
+                mean_valid_seen_reward = sum(total_rewards[:(len(total_rewards)//2)]) / (len(total_rewards) // 2)
+                mean_valid_unseen_reward = sum(total_rewards[(len(total_rewards)//2):]) / (len(total_rewards) // 2)
             
-            mean_valid_seen_reward = sum(total_rewards[:(len(total_rewards)//2)]) / (len(total_rewards) // 2)
-            mean_valid_unseen_reward = sum(total_rewards[(len(total_rewards)//2):]) / (len(total_rewards) // 2)
-            
-            ##################################################
-            ###                   Logging                  ###
-            ##################################################
+                ##################################################
+                ###                   Logging                  ###
+                ##################################################
 
-            # print("==========================LOGGING==========================")
+                # print("==========================LOGGING==========================")
 
-            stats = {'epoch': epoch,
-                     'valid_seen': (mean_valid_seen_reward),
-                     'valid_unseen': (mean_valid_unseen_reward)}
+                stats = {'epoch': epoch,
+                        'valid_seen': (mean_valid_seen_reward),
+                        'valid_unseen': (mean_valid_unseen_reward)}
 
-            # check reward if better then save
-            # new best valid_seen loss
-            if mean_valid_seen_reward is not None and mean_valid_seen_reward > mean_reward['valid_seen']:
-                print('\nFound new best valid_seen!! Saving...')
-                fsave = os.path.join(args.dout, 'best_seen.pth')
+                # check reward if better then save
+                # new best valid_seen loss
+                if mean_valid_seen_reward is not None and mean_valid_seen_reward > mean_reward['valid_seen']:
+                    print('\nFound new best valid_seen!! Saving...')
+                    fsave = os.path.join(args.dout, 'best_seen.pth')
+                    torch.save({
+                        'metric': stats,
+                        'model': self.state_dict(),
+                        'optim': optimizer.state_dict(),
+                        'args': self.args,
+                        'vocab': self.vocab,
+                    }, fsave)
+                    fbest = os.path.join(args.dout, 'best_seen.json')
+                    with open(fbest, 'wt') as f:
+                        json.dump(stats, f, indent=2)
+
+                    # fpred = os.path.join(args.dout, 'valid_seen.debug.preds.json')
+                    # with open(fpred, 'wt') as f:
+                    #     json.dump(self.make_debug(p_valid_seen, valid_seen), f, indent=2)
+                    mean_reward['valid_seen'] = mean_valid_seen_reward
+
+                # new best valid_unseen loss
+                if mean_valid_unseen_reward is not None and mean_valid_unseen_reward < mean_reward['valid_unseen']:
+                    print('Found new best valid_unseen!! Saving...')
+                    fsave = os.path.join(args.dout, 'best_unseen.pth')
+                    torch.save({
+                        'metric': stats,
+                        'model': self.state_dict(),
+                        'optim': optimizer.state_dict(),
+                        'args': self.args,
+                        'vocab': self.vocab,
+                    }, fsave)
+                    fbest = os.path.join(args.dout, 'best_unseen.json')
+                    with open(fbest, 'wt') as f:
+                        json.dump(stats, f, indent=2)
+
+                    # fpred = os.path.join(args.dout, 'valid_unseen.debug.preds.json')
+                    # with open(fpred, 'wt') as f:
+                    #     json.dump(self.make_debug(p_valid_unseen, valid_unseen), f, indent=2)
+                    mean_reward['valid_unseen'] = mean_valid_unseen_reward
+
+
+
+                # save the latest checkpoint
+                if args.save_every_epoch:
+                    fsave = os.path.join(args.dout, 'net_epoch_%d.pth' % epoch)
+                else:
+                    fsave = os.path.join(args.dout, 'latest.pth')
                 torch.save({
                     'metric': stats,
                     'model': self.state_dict(),
@@ -379,61 +423,18 @@ class Module(nn.Module):
                     'args': self.args,
                     'vocab': self.vocab,
                 }, fsave)
-                fbest = os.path.join(args.dout, 'best_seen.json')
-                with open(fbest, 'wt') as f:
-                    json.dump(stats, f, indent=2)
 
-                # fpred = os.path.join(args.dout, 'valid_seen.debug.preds.json')
+                ## debug action output json for train
+                # fpred = os.path.join(args.dout, 'train.debug.preds.json')
                 # with open(fpred, 'wt') as f:
-                #     json.dump(self.make_debug(p_valid_seen, valid_seen), f, indent=2)
-                mean_reward['valid_seen'] = mean_valid_seen_reward
+                #     json.dump(self.make_debug(p_train, train), f, indent=2)
 
-            # new best valid_unseen loss
-            if mean_valid_unseen_reward is not None and mean_valid_unseen_reward < mean_reward['valid_unseen']:
-                print('Found new best valid_unseen!! Saving...')
-                fsave = os.path.join(args.dout, 'best_unseen.pth')
-                torch.save({
-                    'metric': stats,
-                    'model': self.state_dict(),
-                    'optim': optimizer.state_dict(),
-                    'args': self.args,
-                    'vocab': self.vocab,
-                }, fsave)
-                fbest = os.path.join(args.dout, 'best_unseen.json')
-                with open(fbest, 'wt') as f:
-                    json.dump(stats, f, indent=2)
-
-                # fpred = os.path.join(args.dout, 'valid_unseen.debug.preds.json')
-                # with open(fpred, 'wt') as f:
-                #     json.dump(self.make_debug(p_valid_unseen, valid_unseen), f, indent=2)
-                mean_reward['valid_unseen'] = mean_valid_unseen_reward
-
-
-
-            # save the latest checkpoint
-            if args.save_every_epoch:
-                fsave = os.path.join(args.dout, 'net_epoch_%d.pth' % epoch)
-            else:
-                fsave = os.path.join(args.dout, 'latest.pth')
-            torch.save({
-                'metric': stats,
-                'model': self.state_dict(),
-                'optim': optimizer.state_dict(),
-                'args': self.args,
-                'vocab': self.vocab,
-            }, fsave)
-
-            ## debug action output json for train
-            # fpred = os.path.join(args.dout, 'train.debug.preds.json')
-            # with open(fpred, 'wt') as f:
-            #     json.dump(self.make_debug(p_train, train), f, indent=2)
-
-            # write stats
-            for split in stats.keys():
-                if isinstance(stats[split], dict):
-                    for k, v in stats[split].items():
-                        self.summary_writer.add_scalar(split + '/' + k, v, train_iter)
-            pprint.pprint(stats)
+                # write stats
+                for split in stats.keys():
+                    if isinstance(stats[split], dict):
+                        for k, v in stats[split].items():
+                            self.summary_writer.add_scalar(split + '/' + k, v, train_iter)
+                pprint.pprint(stats)
 
     def run_pred(self, dev, args=None, name='dev', iter=0):
         '''
