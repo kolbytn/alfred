@@ -53,6 +53,7 @@ if __name__ == '__main__':
     parser.add_argument('--max_steps', type=int, default=100, help='max steps before episode termination')
     parser.add_argument('--max_fails', type=int, default=10, help='max API execution failures before episode termination')
     parser.add_argument('--episodes_per_epoch', type=int, default=0, help='number of episodes to gather each epoch for reinforcement learning')
+    parser.add_argument('--ppo_epochs', type=int, default=0, help='number of epochs to run on PPO step')
     parser.add_argument('--batches_per_epoch', type=int, default=float('inf'), help='max number of immitation learning batches for each epoch')
 
     # dropouts

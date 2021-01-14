@@ -7,6 +7,7 @@ import collections
 from PIL import Image
 import numpy as np
 from torch import nn
+from torch.utils.data import Dataset, DataLoader
 from tensorboardX import SummaryWriter
 from tqdm import trange
 
@@ -56,6 +57,8 @@ class Module(nn.Module):
         # args
         args = args or self.args
 
+        device = torch.device('cuda') if self.args.gpu else torch.device('cpu')
+
         # splits
         train = splits['train']
         valid_seen = splits['valid_seen']
@@ -100,6 +103,7 @@ class Module(nn.Module):
             ###           Reinforcement Learning           ###
             ##################################################
 
+            # Collect Rollouts
             rollouts = []
             for _ in range(args.episodes_per_epoch):
 
@@ -126,18 +130,17 @@ class Module(nn.Module):
                     feat['frames'] = self.resnet.featurize([curr_image], batch=1).unsqueeze(0)
 
                     # forward model
-                    m_out = self.step(feat)
-                    m_pred = self.extract_preds(m_out, [traj_data], feat, clean_special_tokens=False)
-                    m_pred = list(m_pred.values())[0]
+                    out = self.step(feat)
+                    pred = self.sample_pred(out)
 
                     # # check if <<stop>> was predicted
-                    # if m_pred['action_low'] == "<<stop>>":
+                    # if pred['action_low'] == "<<stop>>":
                     #     print("\tpredicted STOP")
                     #     break
 
                     # get action and mask
-                    action, mask = m_pred['action_low'], m_pred['action_low_mask'][0]
-                    mask = np.squeeze(mask, axis=0) if self.has_interaction(action) else None
+                    action = pred['action_low']
+                    mask = pred['action_low_mask'] if self.has_interaction(action) else None
 
                     # use predicted action and mask (if available) to interact with the env
                     t_success, _, _, err, _ = env.va_interact(action, interact_mask=mask, smooth_nav=args.smooth_nav, debug=args.debug)
@@ -154,16 +157,94 @@ class Module(nn.Module):
                     num_steps += 1
 
                     curr_rollout.append({
-                        'frames': feat['frames'],
-                        'out_action_low': feat['out_action_low'],
-                        'out_action_low_mask': feat['out_action_low_mask'],
-                        'action_low': action,
-                        'action_low_mask': mask
+                        'frames': feat['frames'].to('cpu'),
+                        'lang_goal_instr': feat['lang_goal_instr'].to('cpu'),
+                        'action_dist': pred['action_low_dist'].detach().to('cpu'),
+                        'action_mask_dist': pred['action_low_mask_dist'].detach().to('cpu'),
+                        'action_idx': pred['action_low_idx'].detach().to('cpu'),
+                        'action_mask_idx': pred['action_low_mask_idx'].detach().to('cpu'),
+                        'reward': torch.tensor([reward])
                     })
+
                 rollouts.append(curr_rollout)
-            
-            if len(rollouts) > 0:
-                self.rl_update(rollouts)
+
+            # Prepare Rollouts
+            prepared_rollouts = []
+            for rollout in rollouts:
+
+                prepared_rollout = {
+                    'frames': [],
+                    'lang_goal_instr': [],
+                    'action_dist': torch.empty((len(rollout), 15), dtype=torch.float64),
+                    'action_mask_dist': torch.empty((len(rollout), 300, 300, 2), dtype=torch.float64),
+                    'action_idx': torch.empty((len(rollout), 1), dtype=torch.long),
+                    'action_mask_idx': torch.empty((len(rollout), 300, 300), dtype=torch.long),
+                    'ret': torch.empty((len(rollout), 1), dtype=torch.float64),
+                }
+
+                discounted = 0
+                for i in reversed(range(len(rollout))):
+                    prepared_rollout['frames'].append(rollout[i]['frames'])
+                    prepared_rollout['lang_goal_instr'].append(rollout[i]['lang_goal_instr'])
+
+                    prepared_rollout['action_dist'][i] = rollout[i]['action_dist']
+                    prepared_rollout['action_mask_dist'][i] = rollout[i]['action_mask_dist']
+                    prepared_rollout['action_idx'][i] = rollout[i]['action_idx']
+                    prepared_rollout['action_mask_idx'][i] = rollout[i]['action_mask_idx']
+
+                    discounted = args.gamma * discounted + rollout[i]['reward']
+                    prepared_rollout['ret'][i] = discounted
+                prepared_rollouts.append(prepared_rollout)
+
+            # Update Policy
+            for _ in range(args.ppo_epochs):
+                random.shuffle(prepared_rollouts)
+                for rollout in prepared_rollouts:
+                    self.reset()
+                    optimizer.zero_grad()
+
+                    ret = rollout['ret'].to(device)
+                    prev_action_dist = rollout['action_dist'].to(device)
+                    prev_action_mask_dist = rollout['action_mask_dist'].to(device)
+                    action_idx = rollout['action_idx'].to(device)
+                    action_mask_idx = rollout['action_mask_idx'].to(device)
+
+                    out_value = torch.empty((len(rollout['frames']), 1), dtype=torch.float64, device=device)
+                    curr_action_dist = torch.empty((len(rollout['frames']), 15), dtype=torch.float64, device=device)
+                    curr_action_mask_dist = torch.empty((len(rollout['frames']), 300, 300, 2), dtype=torch.float64, device=device)
+                    for i, (f, lgi) in enumerate(zip(rollout['frames'], rollout['lang_goal_instr'])):
+                        feat = {
+                            'frames': f.to(device),
+                            'lang_goal_instr': lgi.to(device),
+                        }
+                        feat['frames'].detach_()
+                        feat['lang_goal_instr'].data.detach_()
+                        out = self.step(feat)
+                        pred = self.sample_pred(out)
+                        out_value[i] = out['out_value'][0][0]
+                        curr_action_dist[i] = pred['action_low_dist']
+                        curr_action_mask_dist[i] = pred['action_low_mask_dist']
+
+                    advantage = ret - out_value
+                    value_loss = args.value_constant * torch.mean((ret - out_value) ** 2)
+                    advantage.detach_()
+
+                    curr_prob = torch.log(curr_action_dist[range(curr_action_dist.shape[0]), action_idx.squeeze(1)].unsqueeze(1))
+                    prev_prob = torch.log(prev_action_dist[range(prev_action_dist.shape[0]), action_idx.squeeze(1)].unsqueeze(1))
+                    curr_mask_prob = torch.log(curr_action_mask_dist.view(-1, 2)[range(curr_action_mask_dist.view(-1, 2).shape[0]), action_mask_idx.view(-1)].view(-1, 300, 300))
+                    prev_mask_prob = torch.log(prev_action_mask_dist.view(-1, 2)[range(prev_action_mask_dist.view(-1, 2).shape[0]), action_mask_idx.view(-1)].view(-1, 300, 300))
+
+                    curr_total_prob = curr_prob + torch.sum(torch.sum(curr_mask_prob, 1, keepdim=False), 1, keepdim=True)
+                    prev_total_prob = prev_prob + torch.sum(torch.sum(prev_mask_prob, 1, keepdim=False), 1, keepdim=True)
+                    ratio = curr_total_prob - prev_total_prob
+                    left = torch.exp(ratio) * advantage
+                    right = torch.clamp(ratio, 1 - args.epsilon, 1 + args.epsilon) * advantage
+                    policy_loss = args.policy_constant * -torch.mean(torch.min(left, right))
+
+                    loss = value_loss + policy_loss
+                    loss.backward()
+                    optimizer.step()
+                    print("PPO Step... Value Loss: {}, Polcy Loss: {}".format(value_loss, policy_loss))
 
             ##################################################
             ###            Immitation Learning             ###
@@ -328,6 +409,9 @@ class Module(nn.Module):
         raise NotImplementedError()
 
     def extract_preds(self, out, batch, feat):
+        raise NotImplementedError()
+
+    def sample_pred(self, feat):
         raise NotImplementedError()
 
     def compute_loss(self, out, batch, feat):

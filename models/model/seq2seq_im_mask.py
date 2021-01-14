@@ -239,7 +239,7 @@ class Module(Base):
         e_t = self.embed_action(prev_action) if prev_action is not None else self.r_state['e_t']
 
         # decode and save embedding and hidden states
-        out_action_low, out_action_low_mask, state_t, *_ = self.dec.step(self.r_state['enc_lang'], feat['frames'][:, 0], e_t=e_t, state_tm1=self.r_state['state_t'])
+        out_action_low, out_action_low_mask, state_t, out_value, *_ = self.dec.step(self.r_state['enc_lang'], feat['frames'][:, 0], e_t=e_t, state_tm1=self.r_state['state_t'])
 
         # save states
         self.r_state['state_t'] = state_t
@@ -248,6 +248,7 @@ class Module(Base):
         # output formatting
         feat['out_action_low'] = out_action_low.unsqueeze(0)
         feat['out_action_low_mask'] = out_action_low_mask.unsqueeze(0)
+        feat['out_value'] = out_value.unsqueeze(0)
         return feat
 
 
@@ -282,6 +283,50 @@ class Module(Base):
                 'action_low': ' '.join(words),
                 'action_low_mask': p_mask,
             }
+
+        return pred
+
+
+    def sample_pred(self, feat):
+        '''
+        output processing
+        '''
+        # print("out_action_low", feat['out_action_low'].shape, feat['out_action_low'].dtype)
+        # print("out_action_low_mask", feat['out_action_low_mask'].shape, feat['out_action_low_mask'].dtype)
+
+        # construct distributions
+        action_low_dist = nn.functional.softmax(feat['out_action_low'].squeeze())
+        # print("action_low_dist", action_low_dist.shape, action_low_dist.dtype)
+        action_low_mask_dist = F.sigmoid(feat['out_action_low_mask'].squeeze())
+        mask_shape = action_low_mask_dist.shape
+        action_low_mask_dist = torch.stack([1 - action_low_mask_dist, action_low_mask_dist], dim=-1)
+        # print("action_low_mask_dist", action_low_mask_dist.shape, action_low_mask_dist.dtype)
+
+        # sample actions
+        action_low_idx = torch.multinomial(action_low_dist, 1)
+        # print("action_low_idx", action_low_idx.shape, action_low_idx.dtype)
+        action_low_mask = torch.multinomial(action_low_mask_dist.view(-1, 2), 1).reshape(mask_shape)
+        # print("action_low_mask", action_low_mask.shape, action_low_mask.dtype)
+
+        # calculate probabilities
+        action_low_prob = action_low_dist[action_low_idx]
+        # print("action_low_prob", action_low_prob.shape, action_low_prob.dtype)
+        action_low_mask_prob = torch.prod(torch.gather(action_low_mask_dist, -1, action_low_mask.unsqueeze(-1))).unsqueeze(0)
+        # print("action_low_mask_prob", action_low_mask_prob.shape, action_low_mask_prob.dtype)
+
+        # index to API actions
+        words = self.vocab['action_low'].index2word(action_low_idx)
+
+        pred = {
+            'action_low': ' '.join(words),
+            'action_low_dist': action_low_dist,
+            'action_low_idx': action_low_idx,
+            'action_low_prob': action_low_prob,
+            'action_low_mask': (action_low_mask > 0).cpu().numpy(),
+            'action_low_mask_dist': action_low_mask_dist,
+            'action_low_mask_idx': action_low_mask,
+            'action_low_mask_prob': action_low_mask_prob,
+        }
 
         return pred
 
@@ -341,10 +386,6 @@ class Module(Base):
             losses['progress_aux'] = self.args.pm_aux_loss_wt * progress_loss
 
         return losses
-
-
-    def rl_update(self, rollouts):
-        pass
 
 
     def weighted_mask_loss(self, pred_masks, gt_masks):

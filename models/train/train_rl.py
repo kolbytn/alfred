@@ -54,6 +54,11 @@ if __name__ == '__main__':
     parser.add_argument('--max_fails', type=int, default=10, help='max API execution failures before episode termination')
     parser.add_argument('--episodes_per_epoch', type=int, default=1, help='number of episodes to gather each epoch for reinforcement learning')
     parser.add_argument('--batches_per_epoch', type=int, default=1, help='max number of immitation learning batches for each epoch')
+    parser.add_argument('--gamma', type=float, default=0.99, help='return discount factor')
+    parser.add_argument('--epsilon', type=float, default=0.2, help='PPO trust region parameter')
+    parser.add_argument('--value_constant', type=float, default=1, help='PPO value loss scalar')
+    parser.add_argument('--policy_constant', type=float, default=1, help='PPO policy loss scalar')
+    parser.add_argument('--ppo_epochs', type=int, default=5, help='number of epochs to run on PPO step')
 
     # dropouts
     parser.add_argument('--zero_goal', help='zero out goal language', action='store_true')
