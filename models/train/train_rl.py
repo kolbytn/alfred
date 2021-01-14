@@ -59,6 +59,8 @@ if __name__ == '__main__':
     parser.add_argument('--value_constant', type=float, default=1, help='PPO value loss scalar')
     parser.add_argument('--policy_constant', type=float, default=1, help='PPO policy loss scalar')
     parser.add_argument('--ppo_epochs', type=int, default=5, help='number of epochs to run on PPO step')
+    parser.add_argument('--validation_frequency', type=int, default=10, help='frequency of doing validation during training')
+    parser.add_argument('--validation_episodes', type=int, default=20, help='number of episodes per validation')
 
     # dropouts
     parser.add_argument('--zero_goal', help='zero out goal language', action='store_true')
@@ -78,7 +80,9 @@ if __name__ == '__main__':
     parser.add_argument('--debug', dest='debug', action='store_true')
     parser.add_argument('--fast_epoch', help='fast epoch during debugging', action='store_true')
     parser.add_argument('--dataset_fraction', help='use fraction of the dataset for debugging (0 indicates full size)', default=0, type=int)
-    
+    parser.add_argument('--video_output_path', help='path for validation video files', default='data/validation_video/videos/', type=str)
+    parser.add_argument('--video_fps', help='path for validation video fps', default=5, type=int)
+
     # args and init
     args = parser.parse_args()
     args.dout = args.dout.format(**vars(args))

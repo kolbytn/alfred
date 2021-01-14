@@ -10,9 +10,58 @@ from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from tensorboardX import SummaryWriter
 from tqdm import trange
+import time
 
 from env.thor_env import ThorEnv
 from models.nn.resnet import Resnet
+
+
+
+# video recorder helper class
+from datetime import datetime
+import cv2
+class VideoRecord:
+    def __init__(self, path, name, fps=5):
+        """
+        param:
+            path: video save path (str)
+            name: video name (str)
+            fps: frames per second (int) (default=5)
+        example usage:
+            rec = VideoRecord('path/to/', 'filename', 10)
+        """
+        self.path = path
+        self.name = name
+        self.fps = fps
+        self.frames = []
+    def record_frame(self, env_frame):
+        """
+            records video frame in this object
+        param:
+            env_frame: a frame from thor environment (ThorEnv().last_event.frame)
+        example usage:
+            env = Thorenv()
+            lastframe = env.last_event.frame
+            rec.record_frame(lastframes)
+        """
+        curr_image = Image.fromarray(np.uint8(env_frame))
+        img = cv2.cvtColor(np.asarray(curr_image), cv2.COLOR_RGB2BGR)
+        self.frames.append(img)
+    def savemp4(self):
+        """
+            writes video to file at specified location, finalize video file
+        example usage:
+            rec.savemp4()
+        """
+        if len(self.frames) == 0:
+            raise Exception("Can't write video file with no frames recorded")
+        height, width, layers = self.frames[0].shape
+        size = (width,height)
+        out = cv2.VideoWriter(f"{self.path}{self.name}.mp4", 0x7634706d, self.fps, size)
+        for i in range(len(self.frames)):
+            out.write(self.frames[i])
+        out.release()
+
 
 
 class Module(nn.Module):
@@ -94,14 +143,23 @@ class Module(nn.Module):
 
         # display dout
         print("Saving to: %s" % self.args.dout)
-        best_loss = {'train': 1e10, 'valid_seen': 1e10, 'valid_unseen': 1e10}
+        # best_loss = {'train': 1e10, 'valid_seen': 1e10, 'valid_unseen': 1e10}
+        mean_reward = {'train': 0, 'valid_seen': 0, 'valid_unseen': 0}
+
         train_iter, valid_seen_iter, valid_unseen_iter = 0, 0, 0
+        mean_valid_seen_reward = None
+        mean_valid_unseen_reward = None
+
+
+
+        
         for epoch in trange(0, args.epoch, desc='epoch'):
             self.train()
 
             ##################################################
             ###           Reinforcement Learning           ###
             ##################################################
+            # print("==========================REINFORCEMENT LEARNING==========================")
 
             # Collect Rollouts
             rollouts = []
@@ -250,6 +308,8 @@ class Module(nn.Module):
             ###            Immitation Learning             ###
             ##################################################
 
+            # print("==========================IMITATION LEARNING==========================")
+
             m_train = collections.defaultdict(list)
             self.adjust_lr(optimizer, args.lr, epoch, decay_epoch=args.decay_epoch)
             # p_train = {}
@@ -282,36 +342,161 @@ class Module(nn.Module):
             ###                 Validation                 ###
             ##################################################
 
-            ## compute metrics for train (too memory heavy!)
+            # # NOTE: Original Implementation: predict action and compute loss
+            # # compute metrics for train (too memory heavy!)
             # m_train = {k: sum(v) / len(v) for k, v in m_train.items()}
             # m_train.update(self.compute_metric(p_train, train))
             # m_train['total_loss'] = sum(total_train_loss) / len(total_train_loss)
             # self.summary_writer.add_scalar('train/total_loss', m_train['total_loss'], train_iter)
 
-            # compute metrics for valid_seen
-            p_valid_seen, valid_seen_iter, total_valid_seen_loss, m_valid_seen = self.run_pred(valid_seen, args=args, name='valid_seen', iter=valid_seen_iter)
-            m_valid_seen.update(self.compute_metric(p_valid_seen, valid_seen))
-            m_valid_seen['total_loss'] = float(total_valid_seen_loss)
-            self.summary_writer.add_scalar('valid_seen/total_loss', m_valid_seen['total_loss'], valid_seen_iter)
+            # # compute metrics for valid_seen
+            # p_valid_seen, valid_seen_iter, total_valid_seen_loss, m_valid_seen = self.run_pred(valid_seen, args=args, name='valid_seen', iter=valid_seen_iter)
+            # m_valid_seen.update(self.compute_metric(p_valid_seen, valid_seen))
+            # m_valid_seen['total_loss'] = float(total_valid_seen_loss)
+            # self.summary_writer.add_scalar('valid_seen/total_loss', m_valid_seen['total_loss'], valid_seen_iter)
 
-            # compute metrics for valid_unseen
-            p_valid_unseen, valid_unseen_iter, total_valid_unseen_loss, m_valid_unseen = self.run_pred(valid_unseen, args=args, name='valid_unseen', iter=valid_unseen_iter)
-            m_valid_unseen.update(self.compute_metric(p_valid_unseen, valid_unseen))
-            m_valid_unseen['total_loss'] = float(total_valid_unseen_loss)
-            self.summary_writer.add_scalar('valid_unseen/total_loss', m_valid_unseen['total_loss'], valid_unseen_iter)
+            # # compute metrics for valid_unseen
+            # p_valid_unseen, valid_unseen_iter, total_valid_unseen_loss, m_valid_unseen = self.run_pred(valid_unseen, args=args, name='valid_unseen', iter=valid_unseen_iter)
+            # m_valid_unseen.update(self.compute_metric(p_valid_unseen, valid_unseen))
+            # m_valid_unseen['total_loss'] = float(total_valid_unseen_loss)
+            # self.summary_writer.add_scalar('valid_unseen/total_loss', m_valid_unseen['total_loss'], valid_unseen_iter)
 
-            ##################################################
-            ###                   Logging                  ###
-            ##################################################
 
-            stats = {'epoch': epoch,
-                     'valid_seen': m_valid_seen,
-                     'valid_unseen': m_valid_unseen}
+            # # NOTE: RL implementation: rollout and record trajectory
+            if (epoch + 1) % args.validation_frequency == 0:
+                print("==========================VALIDATION==========================")
+                
+                # sampled = random.sample(valid_seen, args.validation_episodes // 2)              # seen envs
+                # sampled.extend(random.sample(valid_unseen, args.validation_episodes // 2))      # unseen envs
+                sampled = valid_seen + valid_unseen
+                print(sampled)
+                total_rewards = [] # 1st half: seen, 2nd half: unseen
+                
+                for i, task in enumerate(sampled):
 
-            # new best valid_seen loss
-            if total_valid_seen_loss < best_loss['valid_seen']:
-                print('\nFound new best valid_seen!! Saving...')
-                fsave = os.path.join(args.dout, 'best_seen.pth')
+                    # reset model
+                    self.reset()
+
+                    # setup scene
+                    traj_data = self.load_task_json(task)
+                    r_idx = task['repeat_idx']
+                    
+
+                    self.setup_scene(env, traj_data, r_idx, args)
+
+                    feat = self.featurize([traj_data], load_frames=False, load_mask=False)
+
+                    done = False
+                    fails = 0
+                    total_reward = 0
+                    num_steps = 0
+
+                    # initialize video recording
+                    task_name = '_'.join(('_'.join(str(datetime.now()).split(':')) + '_' + task['task']).split('/'))
+                    print("video recording: (", task_name, ") created at:", args.video_output_path)
+                    video_recording = VideoRecord(args.video_output_path, task_name, args.video_fps)
+
+                    while not done and num_steps < args.max_steps:
+
+                        # extract visual features
+                        curr_image = Image.fromarray(np.uint8(env.last_event.frame))
+                        feat['frames'] = self.resnet.featurize([curr_image], batch=1).unsqueeze(0)
+
+                        # record video using last observation
+                        video_recording.record_frame(env.last_event.frame)
+
+                        # forward model
+                        m_out = self.step(feat)
+                        m_pred = self.extract_preds(m_out, [traj_data], feat, clean_special_tokens=False)
+                        m_pred = list(m_pred.values())[0]
+
+                        # # check if <<stop>> was predicted
+                        # if m_pred['action_low'] == "<<stop>>":
+                        #     print("\tpredicted STOP")
+                        #     break
+
+                        # get action and mask
+                        action, mask = m_pred['action_low'], m_pred['action_low_mask'][0]
+                        mask = np.squeeze(mask, axis=0) if self.has_interaction(action) else None
+
+                        # use predicted action and mask (if available) to interact with the env
+                        t_success, _, _, err, _ = env.va_interact(action, interact_mask=mask, smooth_nav=args.smooth_nav, debug=args.debug)
+
+                        # if not t_success:
+                        #     fails += 1
+                        #     if fails >= args.max_fails:
+                        #         print("Interact API failed %d times" % fails + "; latest error '%s'" % err)
+                        #         break
+
+                        # next time-step
+                        reward, done = env.get_transition_reward()
+                        total_reward += reward
+                        num_steps += 1
+                    
+                    total_rewards.append(total_reward)
+                    video_recording.savemp4()
+                
+                mean_valid_seen_reward = sum(total_rewards[:(len(total_rewards)//2)]) / (len(total_rewards) // 2)
+                mean_valid_unseen_reward = sum(total_rewards[(len(total_rewards)//2):]) / (len(total_rewards) // 2)
+            
+                ##################################################
+                ###                   Logging                  ###
+                ##################################################
+
+                # print("==========================LOGGING==========================")
+
+                stats = {'epoch': epoch,
+                        'valid_seen': (mean_valid_seen_reward),
+                        'valid_unseen': (mean_valid_unseen_reward)}
+
+                # check reward if better then save
+                # new best valid_seen loss
+                if mean_valid_seen_reward is not None and mean_valid_seen_reward > mean_reward['valid_seen']:
+                    print('\nFound new best valid_seen!! Saving...')
+                    fsave = os.path.join(args.dout, 'best_seen.pth')
+                    torch.save({
+                        'metric': stats,
+                        'model': self.state_dict(),
+                        'optim': optimizer.state_dict(),
+                        'args': self.args,
+                        'vocab': self.vocab,
+                    }, fsave)
+                    fbest = os.path.join(args.dout, 'best_seen.json')
+                    with open(fbest, 'wt') as f:
+                        json.dump(stats, f, indent=2)
+
+                    # fpred = os.path.join(args.dout, 'valid_seen.debug.preds.json')
+                    # with open(fpred, 'wt') as f:
+                    #     json.dump(self.make_debug(p_valid_seen, valid_seen), f, indent=2)
+                    mean_reward['valid_seen'] = mean_valid_seen_reward
+
+                # new best valid_unseen loss
+                if mean_valid_unseen_reward is not None and mean_valid_unseen_reward < mean_reward['valid_unseen']:
+                    print('Found new best valid_unseen!! Saving...')
+                    fsave = os.path.join(args.dout, 'best_unseen.pth')
+                    torch.save({
+                        'metric': stats,
+                        'model': self.state_dict(),
+                        'optim': optimizer.state_dict(),
+                        'args': self.args,
+                        'vocab': self.vocab,
+                    }, fsave)
+                    fbest = os.path.join(args.dout, 'best_unseen.json')
+                    with open(fbest, 'wt') as f:
+                        json.dump(stats, f, indent=2)
+
+                    # fpred = os.path.join(args.dout, 'valid_unseen.debug.preds.json')
+                    # with open(fpred, 'wt') as f:
+                    #     json.dump(self.make_debug(p_valid_unseen, valid_unseen), f, indent=2)
+                    mean_reward['valid_unseen'] = mean_valid_unseen_reward
+
+
+
+                # save the latest checkpoint
+                if args.save_every_epoch:
+                    fsave = os.path.join(args.dout, 'net_epoch_%d.pth' % epoch)
+                else:
+                    fsave = os.path.join(args.dout, 'latest.pth')
                 torch.save({
                     'metric': stats,
                     'model': self.state_dict(),
@@ -319,60 +504,18 @@ class Module(nn.Module):
                     'args': self.args,
                     'vocab': self.vocab,
                 }, fsave)
-                fbest = os.path.join(args.dout, 'best_seen.json')
-                with open(fbest, 'wt') as f:
-                    json.dump(stats, f, indent=2)
 
-                fpred = os.path.join(args.dout, 'valid_seen.debug.preds.json')
-                with open(fpred, 'wt') as f:
-                    json.dump(self.make_debug(p_valid_seen, valid_seen), f, indent=2)
-                best_loss['valid_seen'] = total_valid_seen_loss
+                ## debug action output json for train
+                # fpred = os.path.join(args.dout, 'train.debug.preds.json')
+                # with open(fpred, 'wt') as f:
+                #     json.dump(self.make_debug(p_train, train), f, indent=2)
 
-            # new best valid_unseen loss
-            if total_valid_unseen_loss < best_loss['valid_unseen']:
-                print('Found new best valid_unseen!! Saving...')
-                fsave = os.path.join(args.dout, 'best_unseen.pth')
-                torch.save({
-                    'metric': stats,
-                    'model': self.state_dict(),
-                    'optim': optimizer.state_dict(),
-                    'args': self.args,
-                    'vocab': self.vocab,
-                }, fsave)
-                fbest = os.path.join(args.dout, 'best_unseen.json')
-                with open(fbest, 'wt') as f:
-                    json.dump(stats, f, indent=2)
-
-                fpred = os.path.join(args.dout, 'valid_unseen.debug.preds.json')
-                with open(fpred, 'wt') as f:
-                    json.dump(self.make_debug(p_valid_unseen, valid_unseen), f, indent=2)
-
-                best_loss['valid_unseen'] = total_valid_unseen_loss
-
-            # save the latest checkpoint
-            if args.save_every_epoch:
-                fsave = os.path.join(args.dout, 'net_epoch_%d.pth' % epoch)
-            else:
-                fsave = os.path.join(args.dout, 'latest.pth')
-            torch.save({
-                'metric': stats,
-                'model': self.state_dict(),
-                'optim': optimizer.state_dict(),
-                'args': self.args,
-                'vocab': self.vocab,
-            }, fsave)
-
-            ## debug action output json for train
-            # fpred = os.path.join(args.dout, 'train.debug.preds.json')
-            # with open(fpred, 'wt') as f:
-            #     json.dump(self.make_debug(p_train, train), f, indent=2)
-
-            # write stats
-            for split in stats.keys():
-                if isinstance(stats[split], dict):
-                    for k, v in stats[split].items():
-                        self.summary_writer.add_scalar(split + '/' + k, v, train_iter)
-            pprint.pprint(stats)
+                # write stats
+                for split in stats.keys():
+                    if isinstance(stats[split], dict):
+                        for k, v in stats[split].items():
+                            self.summary_writer.add_scalar(split + '/' + k, v, train_iter)
+                pprint.pprint(stats)
 
     def run_pred(self, dev, args=None, name='dev', iter=0):
         '''
