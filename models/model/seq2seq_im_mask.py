@@ -13,11 +13,11 @@ from gen.utils.image_util import decompress_mask
 
 class Module(Base):
 
-    def __init__(self, args, vocab):
+    def __init__(self, args, vocab, manager=None):
         '''
         Seq2Seq agent
         '''
-        super().__init__(args, vocab)
+        super().__init__(args, vocab, manager)
 
         # encoder and self-attention
         self.enc = nn.LSTM(args.demb, args.dhid, bidirectional=True, batch_first=True)
@@ -291,28 +291,20 @@ class Module(Base):
         '''
         output processing
         '''
-        # print("out_action_low", feat['out_action_low'].shape, feat['out_action_low'].dtype)
-        # print("out_action_low_mask", feat['out_action_low_mask'].shape, feat['out_action_low_mask'].dtype)
 
         # construct distributions
         action_low_dist = nn.functional.softmax(feat['out_action_low'].squeeze())
-        # print("action_low_dist", action_low_dist.shape, action_low_dist.dtype)
         action_low_mask_dist = F.sigmoid(feat['out_action_low_mask'].squeeze())
         mask_shape = action_low_mask_dist.shape
         action_low_mask_dist = torch.stack([1 - action_low_mask_dist, action_low_mask_dist], dim=-1)
-        # print("action_low_mask_dist", action_low_mask_dist.shape, action_low_mask_dist.dtype)
 
         # sample actions
         action_low_idx = torch.multinomial(action_low_dist, 1)
-        # print("action_low_idx", action_low_idx.shape, action_low_idx.dtype)
         action_low_mask = torch.multinomial(action_low_mask_dist.view(-1, 2), 1).reshape(mask_shape)
-        # print("action_low_mask", action_low_mask.shape, action_low_mask.dtype)
 
         # calculate probabilities
         action_low_prob = action_low_dist[action_low_idx]
-        # print("action_low_prob", action_low_prob.shape, action_low_prob.dtype)
         action_low_mask_prob = torch.prod(torch.gather(action_low_mask_dist, -1, action_low_mask.unsqueeze(-1))).unsqueeze(0)
-        # print("action_low_mask_prob", action_low_mask_prob.shape, action_low_mask_prob.dtype)
 
         # index to API actions
         words = self.vocab['action_low'].index2word(action_low_idx)

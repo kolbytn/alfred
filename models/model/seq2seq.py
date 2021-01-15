@@ -7,15 +7,15 @@ import collections
 from PIL import Image
 import numpy as np
 from torch import nn
+import torch.multiprocessing as mp
 from torch.utils.data import Dataset, DataLoader
 from tensorboardX import SummaryWriter
 from tqdm import trange
 import time
+from importlib import import_module
 
 from env.thor_env import ThorEnv
 from models.nn.resnet import Resnet
-
-
 
 # video recorder helper class
 from datetime import datetime
@@ -63,10 +63,9 @@ class VideoRecord:
         out.release()
 
 
-
 class Module(nn.Module):
 
-    def __init__(self, args, vocab):
+    def __init__(self, args, vocab, manager=None):
         '''
         Base Seq2Seq agent with common train and val loops
         '''
@@ -98,13 +97,13 @@ class Module(nn.Module):
         args.visual_model = 'resnet18'
         self.resnet = Resnet(args, eval=True, share_memory=True, use_conv_feat=True)
 
-    def run_train(self, splits, args=None, optimizer=None):
+        # multiprocessing
+        self.manager = manager
+
+    def run_train(self, splits, optimizer=None):
         '''
         training loop
         '''
-
-        # args
-        args = args or self.args
 
         device = torch.device('cuda') if self.args.gpu else torch.device('cpu')
 
@@ -128,18 +127,38 @@ class Module(nn.Module):
             valid_unseen = valid_unseen[:16]
 
         # initialize summary writer for tensorboardX
-        self.summary_writer = SummaryWriter(log_dir=args.dout)
+        self.summary_writer = SummaryWriter(log_dir=self.args.dout)
 
         # dump config
-        fconfig = os.path.join(args.dout, 'config.json')
+        fconfig = os.path.join(self.args.dout, 'config.json')
         with open(fconfig, 'wt') as f:
-            json.dump(vars(args), f, indent=2)
+            json.dump(vars(self.args), f, indent=2)
 
         # optimizer
-        optimizer = optimizer or torch.optim.Adam(self.parameters(), lr=args.lr)
+        optimizer = optimizer or torch.optim.Adam(self.parameters(), lr=self.args.lr)
 
-        # environment
-        env = ThorEnv()
+        # rollout thread model
+        if self.args.episodes_per_epoch > 0:
+            M = import_module('model.{}'.format(self.args.model))
+            thread_model = M.Module(self.args, self.vocab)
+            thread_model.share_memory()
+            thread_model.to(device)
+            task_queue = self.manager.Queue()
+            rollouts = self.manager.Queue()
+            threads = []
+            for _ in range(self.args.num_rollout_threads):
+                thread = mp.Process(target=Module.run_rollouts, args=(thread_model, task_queue, rollouts, self.args))
+                thread.start()
+                threads.append(thread)
+
+        fsave = os.path.join(self.args.dout, 'latest.pth')
+        torch.save({
+            'metric': dict(),
+            'model': self.state_dict(),
+            'optim': optimizer.state_dict(),
+            'args': self.args,
+            'vocab': self.vocab,
+        }, fsave)
 
         # display dout
         print("Saving to: %s" % self.args.dout)
@@ -150,159 +169,88 @@ class Module(nn.Module):
         mean_valid_seen_reward = None
         mean_valid_unseen_reward = None
 
-
-
-        
-        for epoch in trange(0, args.epoch, desc='epoch'):
+        for epoch in trange(0, self.args.epoch, desc='epoch'):
             self.train()
 
             ##################################################
             ###           Reinforcement Learning           ###
             ##################################################
             # print("==========================REINFORCEMENT LEARNING==========================")
+            if self.args.episodes_per_epoch > 0:
 
-            # Collect Rollouts
-            rollouts = []
-            for _ in range(args.episodes_per_epoch):
+                ############### Collect Rollouts #################
+                thread_model.load_state_dict(self.state_dict())
+                
+                for traj in random.sample(train, self.args.episodes_per_epoch):
+                    task_queue.put(traj)
 
-                # reset model
-                self.reset()
+                completed_rollouts = []
+                while len(completed_rollouts) < self.args.episodes_per_epoch:
+                    rollout = rollouts.get()
 
-                # setup scene
-                task = random.sample(train, 1)[0]
-                traj_data = self.load_task_json(task)
-                r_idx = task['repeat_idx']
-                self.setup_scene(env, traj_data, r_idx, args)
+                    discounted = 0
+                    for i in reversed(range(len(rollout))):
+                        discounted = self.args.gamma * discounted + rollout[i]['reward']
+                        rollout[i]['ret'] = discounted
+                    completed_rollouts.append(rollout)
 
-                feat = self.featurize([traj_data], load_frames=False, load_mask=False)
+                ############### Update Policy ###############
+                for _ in range(self.args.ppo_epochs):
+                    random.shuffle(completed_rollouts)
+                    for rollout in completed_rollouts:
+                        self.reset()
+                        optimizer.zero_grad()
 
-                curr_rollout = []
-                done = False
-                fails = 0
-                total_reward = 0
-                num_steps = 0
-                while not done and num_steps < args.max_steps:
+                        ret = torch.empty((len(rollout), 1), dtype=torch.float64, device=device)
+                        out_value = torch.empty((len(rollout), 1), dtype=torch.float64, device=device)
+                        prev_action_dist = torch.empty((len(rollout), 15), dtype=torch.float64, device=device)
+                        prev_action_mask_dist = torch.empty((len(rollout), 300, 300, 2), dtype=torch.float64, device=device)
+                        curr_action_dist = torch.empty((len(rollout), 15), dtype=torch.float64, device=device)
+                        curr_action_mask_dist = torch.empty((len(rollout), 300, 300, 2), dtype=torch.float64, device=device)
+                        action_idx = torch.empty((len(rollout), 1), dtype=torch.long, device=device)
+                        action_mask_idx = torch.empty((len(rollout), 300, 300), dtype=torch.long, device=device)
 
-                    # extract visual features
-                    curr_image = Image.fromarray(np.uint8(env.last_event.frame))
-                    feat['frames'] = self.resnet.featurize([curr_image], batch=1).unsqueeze(0)
+                        for i, step in enumerate(rollout):
+                            feat = {
+                                'frames': torch.from_numpy(step['frames']).detach().to(device), 
+                                'lang_goal_instr': nn.utils.rnn.PackedSequence(torch.from_numpy(step['lang_goal_instr_data']).detach(),
+                                    torch.from_numpy(step['lang_goal_instr_batch']),
+                                    torch.from_numpy(step['lang_goal_instr_sorted']) if step['lang_goal_instr_sorted'] is not None else None,
+                                    torch.from_numpy(step['lang_goal_instr_unsorted']) if step['lang_goal_instr_unsorted'] is not None else None).to(device)
+                            }
+                            out = self.step(feat)
+                            pred = self.sample_pred(out)
 
-                    # forward model
-                    out = self.step(feat)
-                    pred = self.sample_pred(out)
+                            out_value[i] = out['out_value'][0][0]
+                            curr_action_dist[i] = pred['action_low_dist']
+                            curr_action_mask_dist[i] = pred['action_low_mask_dist']
 
-                    # # check if <<stop>> was predicted
-                    # if pred['action_low'] == "<<stop>>":
-                    #     print("\tpredicted STOP")
-                    #     break
+                            ret[i] = torch.from_numpy(step['ret'])
+                            prev_action_dist[i] = torch.from_numpy(step['action_dist'])
+                            prev_action_mask_dist[i] = torch.from_numpy(step['action_mask_dist'])
+                            action_idx[i] = torch.from_numpy(step['action_idx'])
+                            action_mask_idx[i] = torch.from_numpy(step['action_mask_idx'])
 
-                    # get action and mask
-                    action = pred['action_low']
-                    mask = pred['action_low_mask'] if self.has_interaction(action) else None
+                        advantage = ret - out_value
+                        value_loss = self.args.value_constant * torch.mean((ret - out_value) ** 2)
+                        advantage.detach_()
 
-                    # use predicted action and mask (if available) to interact with the env
-                    t_success, _, _, err, _ = env.va_interact(action, interact_mask=mask, smooth_nav=args.smooth_nav, debug=args.debug)
+                        curr_prob = torch.log(curr_action_dist[range(curr_action_dist.shape[0]), action_idx.squeeze(1)].unsqueeze(1))
+                        prev_prob = torch.log(prev_action_dist[range(prev_action_dist.shape[0]), action_idx.squeeze(1)].unsqueeze(1))
+                        curr_mask_prob = torch.log(curr_action_mask_dist.view(-1, 2)[range(curr_action_mask_dist.view(-1, 2).shape[0]), action_mask_idx.view(-1)].view(-1, 300, 300))
+                        prev_mask_prob = torch.log(prev_action_mask_dist.view(-1, 2)[range(prev_action_mask_dist.view(-1, 2).shape[0]), action_mask_idx.view(-1)].view(-1, 300, 300))
 
-                    # if not t_success:
-                    #     fails += 1
-                    #     if fails >= args.max_fails:
-                    #         print("Interact API failed %d times" % fails + "; latest error '%s'" % err)
-                    #         break
+                        curr_total_prob = curr_prob + torch.sum(torch.sum(curr_mask_prob, 1, keepdim=False), 1, keepdim=True)
+                        prev_total_prob = prev_prob + torch.sum(torch.sum(prev_mask_prob, 1, keepdim=False), 1, keepdim=True)
+                        ratio = curr_total_prob - prev_total_prob
+                        left = torch.exp(ratio) * advantage
+                        right = torch.clamp(ratio, 1 - self.args.epsilon, 1 + self.args.epsilon) * advantage
+                        policy_loss = self.args.policy_constant * -torch.mean(torch.min(left, right))
 
-                    # next time-step
-                    reward, done = env.get_transition_reward()
-                    total_reward += reward
-                    num_steps += 1
-
-                    curr_rollout.append({
-                        'frames': feat['frames'].to('cpu'),
-                        'lang_goal_instr': feat['lang_goal_instr'].to('cpu'),
-                        'action_dist': pred['action_low_dist'].detach().to('cpu'),
-                        'action_mask_dist': pred['action_low_mask_dist'].detach().to('cpu'),
-                        'action_idx': pred['action_low_idx'].detach().to('cpu'),
-                        'action_mask_idx': pred['action_low_mask_idx'].detach().to('cpu'),
-                        'reward': torch.tensor([reward])
-                    })
-
-                rollouts.append(curr_rollout)
-
-            # Prepare Rollouts
-            prepared_rollouts = []
-            for rollout in rollouts:
-
-                prepared_rollout = {
-                    'frames': [],
-                    'lang_goal_instr': [],
-                    'action_dist': torch.empty((len(rollout), 15), dtype=torch.float64),
-                    'action_mask_dist': torch.empty((len(rollout), 300, 300, 2), dtype=torch.float64),
-                    'action_idx': torch.empty((len(rollout), 1), dtype=torch.long),
-                    'action_mask_idx': torch.empty((len(rollout), 300, 300), dtype=torch.long),
-                    'ret': torch.empty((len(rollout), 1), dtype=torch.float64),
-                }
-
-                discounted = 0
-                for i in reversed(range(len(rollout))):
-                    prepared_rollout['frames'].append(rollout[i]['frames'])
-                    prepared_rollout['lang_goal_instr'].append(rollout[i]['lang_goal_instr'])
-
-                    prepared_rollout['action_dist'][i] = rollout[i]['action_dist']
-                    prepared_rollout['action_mask_dist'][i] = rollout[i]['action_mask_dist']
-                    prepared_rollout['action_idx'][i] = rollout[i]['action_idx']
-                    prepared_rollout['action_mask_idx'][i] = rollout[i]['action_mask_idx']
-
-                    discounted = args.gamma * discounted + rollout[i]['reward']
-                    prepared_rollout['ret'][i] = discounted
-                prepared_rollouts.append(prepared_rollout)
-
-            # Update Policy
-            for _ in range(args.ppo_epochs):
-                random.shuffle(prepared_rollouts)
-                for rollout in prepared_rollouts:
-                    self.reset()
-                    optimizer.zero_grad()
-
-                    ret = rollout['ret'].to(device)
-                    prev_action_dist = rollout['action_dist'].to(device)
-                    prev_action_mask_dist = rollout['action_mask_dist'].to(device)
-                    action_idx = rollout['action_idx'].to(device)
-                    action_mask_idx = rollout['action_mask_idx'].to(device)
-
-                    out_value = torch.empty((len(rollout['frames']), 1), dtype=torch.float64, device=device)
-                    curr_action_dist = torch.empty((len(rollout['frames']), 15), dtype=torch.float64, device=device)
-                    curr_action_mask_dist = torch.empty((len(rollout['frames']), 300, 300, 2), dtype=torch.float64, device=device)
-                    for i, (f, lgi) in enumerate(zip(rollout['frames'], rollout['lang_goal_instr'])):
-                        feat = {
-                            'frames': f.to(device),
-                            'lang_goal_instr': lgi.to(device),
-                        }
-                        feat['frames'].detach_()
-                        feat['lang_goal_instr'].data.detach_()
-                        out = self.step(feat)
-                        pred = self.sample_pred(out)
-                        out_value[i] = out['out_value'][0][0]
-                        curr_action_dist[i] = pred['action_low_dist']
-                        curr_action_mask_dist[i] = pred['action_low_mask_dist']
-
-                    advantage = ret - out_value
-                    value_loss = args.value_constant * torch.mean((ret - out_value) ** 2)
-                    advantage.detach_()
-
-                    curr_prob = torch.log(curr_action_dist[range(curr_action_dist.shape[0]), action_idx.squeeze(1)].unsqueeze(1))
-                    prev_prob = torch.log(prev_action_dist[range(prev_action_dist.shape[0]), action_idx.squeeze(1)].unsqueeze(1))
-                    curr_mask_prob = torch.log(curr_action_mask_dist.view(-1, 2)[range(curr_action_mask_dist.view(-1, 2).shape[0]), action_mask_idx.view(-1)].view(-1, 300, 300))
-                    prev_mask_prob = torch.log(prev_action_mask_dist.view(-1, 2)[range(prev_action_mask_dist.view(-1, 2).shape[0]), action_mask_idx.view(-1)].view(-1, 300, 300))
-
-                    curr_total_prob = curr_prob + torch.sum(torch.sum(curr_mask_prob, 1, keepdim=False), 1, keepdim=True)
-                    prev_total_prob = prev_prob + torch.sum(torch.sum(prev_mask_prob, 1, keepdim=False), 1, keepdim=True)
-                    ratio = curr_total_prob - prev_total_prob
-                    left = torch.exp(ratio) * advantage
-                    right = torch.clamp(ratio, 1 - args.epsilon, 1 + args.epsilon) * advantage
-                    policy_loss = args.policy_constant * -torch.mean(torch.min(left, right))
-
-                    loss = value_loss + policy_loss
-                    loss.backward()
-                    optimizer.step()
-                    print("PPO Step... Value Loss: {}, Polcy Loss: {}".format(value_loss, policy_loss))
+                        loss = value_loss + policy_loss
+                        loss.backward()
+                        optimizer.step()
+                        print("PPO Step... Value Loss: {}, Polcy Loss: {}".format(value_loss, policy_loss))
 
             ##################################################
             ###            Immitation Learning             ###
@@ -311,13 +259,13 @@ class Module(nn.Module):
             # print("==========================IMITATION LEARNING==========================")
 
             m_train = collections.defaultdict(list)
-            self.adjust_lr(optimizer, args.lr, epoch, decay_epoch=args.decay_epoch)
+            self.adjust_lr(optimizer, self.args.lr, epoch, decay_epoch=self.args.decay_epoch)
             # p_train = {}
             total_train_loss = list()
             random.shuffle(train) # shuffle every epoch
-            sampled_train = train[:args.batch * args.batches_per_epoch] if args.batch * args.batches_per_epoch < len(train) else train
+            sampled_train = train[:self.args.batch * self.args.batches_per_epoch] if self.args.batch * self.args.batches_per_epoch < len(train) else train
 
-            for batch, feat in self.iterate(sampled_train, args.batch):
+            for batch, feat in self.iterate(sampled_train, self.args.batch):
                 out = self.forward(feat)
                 preds = self.extract_preds(out, batch, feat)
                 # p_train.update(preds)
@@ -350,24 +298,24 @@ class Module(nn.Module):
             # self.summary_writer.add_scalar('train/total_loss', m_train['total_loss'], train_iter)
 
             # # compute metrics for valid_seen
-            # p_valid_seen, valid_seen_iter, total_valid_seen_loss, m_valid_seen = self.run_pred(valid_seen, args=args, name='valid_seen', iter=valid_seen_iter)
+            # p_valid_seen, valid_seen_iter, total_valid_seen_loss, m_valid_seen = self.run_pred(valid_seen, args=self.args, name='valid_seen', iter=valid_seen_iter)
             # m_valid_seen.update(self.compute_metric(p_valid_seen, valid_seen))
             # m_valid_seen['total_loss'] = float(total_valid_seen_loss)
             # self.summary_writer.add_scalar('valid_seen/total_loss', m_valid_seen['total_loss'], valid_seen_iter)
 
             # # compute metrics for valid_unseen
-            # p_valid_unseen, valid_unseen_iter, total_valid_unseen_loss, m_valid_unseen = self.run_pred(valid_unseen, args=args, name='valid_unseen', iter=valid_unseen_iter)
+            # p_valid_unseen, valid_unseen_iter, total_valid_unseen_loss, m_valid_unseen = self.run_pred(valid_unseen, args=self.args, name='valid_unseen', iter=valid_unseen_iter)
             # m_valid_unseen.update(self.compute_metric(p_valid_unseen, valid_unseen))
             # m_valid_unseen['total_loss'] = float(total_valid_unseen_loss)
             # self.summary_writer.add_scalar('valid_unseen/total_loss', m_valid_unseen['total_loss'], valid_unseen_iter)
 
 
             # # NOTE: RL implementation: rollout and record trajectory
-            if (epoch + 1) % args.validation_frequency == 0:
+            if (epoch + 1) % self.args.validation_frequency == 0:
                 print("==========================VALIDATION==========================")
                 
-                # sampled = random.sample(valid_seen, args.validation_episodes // 2)              # seen envs
-                # sampled.extend(random.sample(valid_unseen, args.validation_episodes // 2))      # unseen envs
+                # sampled = random.sample(valid_seen, self.args.validation_episodes // 2)              # seen envs
+                # sampled.extend(random.sample(valid_unseen, self.args.validation_episodes // 2))      # unseen envs
                 sampled = valid_seen + valid_unseen
                 print(sampled)
                 total_rewards = [] # 1st half: seen, 2nd half: unseen
@@ -382,7 +330,7 @@ class Module(nn.Module):
                     r_idx = task['repeat_idx']
                     
 
-                    self.setup_scene(env, traj_data, r_idx, args)
+                    self.setup_scene(env, traj_data, r_idx, self.args)
 
                     feat = self.featurize([traj_data], load_frames=False, load_mask=False)
 
@@ -393,10 +341,10 @@ class Module(nn.Module):
 
                     # initialize video recording
                     task_name = '_'.join(('_'.join(str(datetime.now()).split(':')) + '_' + task['task']).split('/'))
-                    print("video recording: (", task_name, ") created at:", args.video_output_path)
-                    video_recording = VideoRecord(args.video_output_path, task_name, args.video_fps)
+                    print("video recording: (", task_name, ") created at:", self.args.video_output_path)
+                    video_recording = VideoRecord(self.args.video_output_path, task_name, self.args.video_fps)
 
-                    while not done and num_steps < args.max_steps:
+                    while not done and num_steps < self.args.max_steps:
 
                         # extract visual features
                         curr_image = Image.fromarray(np.uint8(env.last_event.frame))
@@ -420,11 +368,11 @@ class Module(nn.Module):
                         mask = np.squeeze(mask, axis=0) if self.has_interaction(action) else None
 
                         # use predicted action and mask (if available) to interact with the env
-                        t_success, _, _, err, _ = env.va_interact(action, interact_mask=mask, smooth_nav=args.smooth_nav, debug=args.debug)
+                        t_success, _, _, err, _ = env.va_interact(action, interact_mask=mask, smooth_nav=self.args.smooth_nav, debug=self.args.debug)
 
                         # if not t_success:
                         #     fails += 1
-                        #     if fails >= args.max_fails:
+                        #     if fails >= self.args.max_fails:
                         #         print("Interact API failed %d times" % fails + "; latest error '%s'" % err)
                         #         break
 
@@ -453,7 +401,7 @@ class Module(nn.Module):
                 # new best valid_seen loss
                 if mean_valid_seen_reward is not None and mean_valid_seen_reward > mean_reward['valid_seen']:
                     print('\nFound new best valid_seen!! Saving...')
-                    fsave = os.path.join(args.dout, 'best_seen.pth')
+                    fsave = os.path.join(self.args.dout, 'best_seen.pth')
                     torch.save({
                         'metric': stats,
                         'model': self.state_dict(),
@@ -461,7 +409,7 @@ class Module(nn.Module):
                         'args': self.args,
                         'vocab': self.vocab,
                     }, fsave)
-                    fbest = os.path.join(args.dout, 'best_seen.json')
+                    fbest = os.path.join(self.args.dout, 'best_seen.json')
                     with open(fbest, 'wt') as f:
                         json.dump(stats, f, indent=2)
 
@@ -473,7 +421,7 @@ class Module(nn.Module):
                 # new best valid_unseen loss
                 if mean_valid_unseen_reward is not None and mean_valid_unseen_reward < mean_reward['valid_unseen']:
                     print('Found new best valid_unseen!! Saving...')
-                    fsave = os.path.join(args.dout, 'best_unseen.pth')
+                    fsave = os.path.join(self.args.dout, 'best_unseen.pth')
                     torch.save({
                         'metric': stats,
                         'model': self.state_dict(),
@@ -481,11 +429,11 @@ class Module(nn.Module):
                         'args': self.args,
                         'vocab': self.vocab,
                     }, fsave)
-                    fbest = os.path.join(args.dout, 'best_unseen.json')
+                    fbest = os.path.join(self.args.dout, 'best_unseen.json')
                     with open(fbest, 'wt') as f:
                         json.dump(stats, f, indent=2)
 
-                    # fpred = os.path.join(args.dout, 'valid_unseen.debug.preds.json')
+                    # fpred = os.path.join(self.args.dout, 'valid_unseen.debug.preds.json')
                     # with open(fpred, 'wt') as f:
                     #     json.dump(self.make_debug(p_valid_unseen, valid_unseen), f, indent=2)
                     mean_reward['valid_unseen'] = mean_valid_unseen_reward
@@ -493,10 +441,10 @@ class Module(nn.Module):
 
 
                 # save the latest checkpoint
-                if args.save_every_epoch:
-                    fsave = os.path.join(args.dout, 'net_epoch_%d.pth' % epoch)
+                if self.args.save_every_epoch:
+                    fsave = os.path.join(self.args.dout, 'net_epoch_%d.pth' % epoch)
                 else:
-                    fsave = os.path.join(args.dout, 'latest.pth')
+                    fsave = os.path.join(self.args.dout, 'latest.pth')
                 torch.save({
                     'metric': stats,
                     'model': self.state_dict(),
@@ -506,7 +454,7 @@ class Module(nn.Module):
                 }, fsave)
 
                 ## debug action output json for train
-                # fpred = os.path.join(args.dout, 'train.debug.preds.json')
+                # fpred = os.path.join(self.args.dout, 'train.debug.preds.json')
                 # with open(fpred, 'wt') as f:
                 #     json.dump(self.make_debug(p_train, train), f, indent=2)
 
@@ -516,6 +464,84 @@ class Module(nn.Module):
                         for k, v in stats[split].items():
                             self.summary_writer.add_scalar(split + '/' + k, v, train_iter)
                 pprint.pprint(stats)
+
+        for _ in range(len(threads)):
+            task_queue.put(None)
+        for t in threads:
+            t.join()
+
+    @classmethod
+    def run_rollouts(cls, model, task_queue, rollouts, args):
+        env = ThorEnv()
+
+        while True:
+            task = task_queue.get()
+            if task is None:
+                break
+
+            # reset model
+            model.reset()
+
+            # setup scene
+            traj_data = model.load_task_json(task)
+            r_idx = task['repeat_idx']
+            cls.setup_scene(env, traj_data, r_idx, args)
+
+            feat = model.featurize([traj_data], load_frames=False, load_mask=False)
+
+            curr_rollout = []
+            done = False
+            fails = 0
+            total_reward = 0
+            num_steps = 0
+            while not done and num_steps < args.max_steps:
+
+                # extract visual features
+                curr_image = Image.fromarray(np.uint8(env.last_event.frame))
+                feat['frames'] = model.resnet.featurize([curr_image], batch=1).unsqueeze(0)
+
+                # forward model
+                out = model.step(feat)
+                pred = model.sample_pred(out)
+
+                # # check if <<stop>> was predicted
+                # if pred['action_low'] == "<<stop>>":
+                #     print("\tpredicted STOP")
+                #     break
+
+                # get action and mask
+                action = pred['action_low']
+                mask = pred['action_low_mask'] if cls.has_interaction(action) else None
+
+                # use predicted action and mask (if available) to interact with the env
+                t_success, _, _, err, _ = env.va_interact(action, interact_mask=mask, smooth_nav=args.smooth_nav, debug=args.debug)
+
+                # if not t_success:
+                #     fails += 1
+                #     if fails >= args.max_fails:
+                #         print("Interact API failed %d times" % fails + "; latest error '%s'" % err)
+                #         break
+
+                # next time-step
+                reward, done = env.get_transition_reward()
+                total_reward += reward
+                num_steps += 1
+
+                curr_rollout.append({
+                    'frames': feat['frames'].cpu().detach().numpy(),
+                    'lang_goal_instr_data': feat['lang_goal_instr'].data.cpu().detach().numpy(),
+                    'lang_goal_instr_batch': feat['lang_goal_instr'].batch_sizes.cpu().detach().numpy(),
+                    'lang_goal_instr_sorted': feat['lang_goal_instr'].sorted_indices.cpu().detach().numpy() if feat['lang_goal_instr'].sorted_indices is not None else None,
+                    'lang_goal_instr_unsorted': feat['lang_goal_instr'].unsorted_indices.cpu().detach().numpy() if feat['lang_goal_instr'].unsorted_indices is not None else None,
+                    'action_dist': pred['action_low_dist'].cpu().detach().numpy(),
+                    'action_mask_dist': pred['action_low_mask_dist'].cpu().detach().numpy(),
+                    'action_idx': pred['action_low_idx'].cpu().detach().numpy(),
+                    'action_mask_idx': pred['action_low_mask_idx'].cpu().detach().numpy(),
+                    'reward': np.array([reward])
+                })
+
+            rollouts.put(curr_rollout)
+        env.stop()
 
     def run_pred(self, dev, args=None, name='dev', iter=0):
         '''
