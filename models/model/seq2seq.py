@@ -194,42 +194,59 @@ class Module(nn.Module):
                         rollout[i]['ret'] = discounted
                     completed_rollouts.append(rollout)
 
-                ############### Update Policy ###############
                 for _ in range(self.args.ppo_epochs):
+
                     random.shuffle(completed_rollouts)
-                    for rollout in completed_rollouts:
-                        self.reset()
+                    batch_idx = 0
+                    while batch_idx < len(completed_rollouts):
+
+                        ############### Prepare Batch #################
+                        if batch_idx + self.args.ppo_batch < len(completed_rollouts):
+                            batch_rollouts = completed_rollouts[batch_idx:batch_idx+self.args.ppo_batch] 
+                        else:
+                            batch_rollouts = completed_rollouts[batch_idx:]
+                        batch_idx += len(batch_rollouts)
+
+                        batch_size = sum(len(rollout) for rollout in batch_rollouts)
+
+                        ret = torch.empty((batch_size, 1), dtype=torch.float64, device=device)
+                        out_value = torch.empty((batch_size, 1), dtype=torch.float64, device=device)
+                        prev_action_dist = torch.empty((batch_size, 15), dtype=torch.float64, device=device)
+                        prev_action_mask_dist = torch.empty((batch_size, 300, 300, 2), dtype=torch.float64, device=device)
+                        curr_action_dist = torch.empty((batch_size, 15), dtype=torch.float64, device=device)
+                        curr_action_mask_dist = torch.empty((batch_size, 300, 300, 2), dtype=torch.float64, device=device)
+                        action_idx = torch.empty((batch_size, 1), dtype=torch.long, device=device)
+                        action_mask_idx = torch.empty((batch_size, 300, 300), dtype=torch.long, device=device)
+
+                        step_idx = 0
+                        for i, rollout in enumerate(batch_rollouts):
+                            self.reset()
+
+                            for j, step in enumerate(rollout):
+                                feat = {
+                                    'frames': torch.from_numpy(step['frames']).detach().to(device), 
+                                    'lang_goal_instr': nn.utils.rnn.PackedSequence(torch.from_numpy(step['lang_goal_instr_data']).detach(),
+                                        torch.from_numpy(step['lang_goal_instr_batch']),
+                                        torch.from_numpy(step['lang_goal_instr_sorted']) if step['lang_goal_instr_sorted'] is not None else None,
+                                        torch.from_numpy(step['lang_goal_instr_unsorted']) if step['lang_goal_instr_unsorted'] is not None else None).to(device)
+                                }
+                                out = self.step(feat)
+                                pred = self.sample_pred(out)
+
+                                out_value[step_idx] = out['out_value'][0][0]
+                                curr_action_dist[step_idx] = pred['action_low_dist']
+                                curr_action_mask_dist[step_idx] = pred['action_low_mask_dist']
+
+                                ret[step_idx] = torch.from_numpy(step['ret'])
+                                prev_action_dist[step_idx] = torch.from_numpy(step['action_dist'])
+                                prev_action_mask_dist[step_idx] = torch.from_numpy(step['action_mask_dist'])
+                                action_idx[step_idx] = torch.from_numpy(step['action_idx'])
+                                action_mask_idx[step_idx] = torch.from_numpy(step['action_mask_idx'])
+
+                                step_idx += 1
+
+                        ############### Update Policy ###############
                         optimizer.zero_grad()
-
-                        ret = torch.empty((len(rollout), 1), dtype=torch.float64, device=device)
-                        out_value = torch.empty((len(rollout), 1), dtype=torch.float64, device=device)
-                        prev_action_dist = torch.empty((len(rollout), 15), dtype=torch.float64, device=device)
-                        prev_action_mask_dist = torch.empty((len(rollout), 300, 300, 2), dtype=torch.float64, device=device)
-                        curr_action_dist = torch.empty((len(rollout), 15), dtype=torch.float64, device=device)
-                        curr_action_mask_dist = torch.empty((len(rollout), 300, 300, 2), dtype=torch.float64, device=device)
-                        action_idx = torch.empty((len(rollout), 1), dtype=torch.long, device=device)
-                        action_mask_idx = torch.empty((len(rollout), 300, 300), dtype=torch.long, device=device)
-
-                        for i, step in enumerate(rollout):
-                            feat = {
-                                'frames': torch.from_numpy(step['frames']).detach().to(device), 
-                                'lang_goal_instr': nn.utils.rnn.PackedSequence(torch.from_numpy(step['lang_goal_instr_data']).detach(),
-                                    torch.from_numpy(step['lang_goal_instr_batch']),
-                                    torch.from_numpy(step['lang_goal_instr_sorted']) if step['lang_goal_instr_sorted'] is not None else None,
-                                    torch.from_numpy(step['lang_goal_instr_unsorted']) if step['lang_goal_instr_unsorted'] is not None else None).to(device)
-                            }
-                            out = self.step(feat)
-                            pred = self.sample_pred(out)
-
-                            out_value[i] = out['out_value'][0][0]
-                            curr_action_dist[i] = pred['action_low_dist']
-                            curr_action_mask_dist[i] = pred['action_low_mask_dist']
-
-                            ret[i] = torch.from_numpy(step['ret'])
-                            prev_action_dist[i] = torch.from_numpy(step['action_dist'])
-                            prev_action_mask_dist[i] = torch.from_numpy(step['action_mask_dist'])
-                            action_idx[i] = torch.from_numpy(step['action_idx'])
-                            action_mask_idx[i] = torch.from_numpy(step['action_mask_idx'])
 
                         advantage = ret - out_value
                         value_loss = self.args.value_constant * torch.mean((ret - out_value) ** 2)
@@ -250,7 +267,8 @@ class Module(nn.Module):
                         loss = value_loss + policy_loss
                         loss.backward()
                         optimizer.step()
-                        print("PPO Step... Value Loss: {}, Polcy Loss: {}".format(value_loss, policy_loss))
+                        print("PPO Step... Value Loss: {:.2f}, Polcy Loss: {:.2f}".format(
+                              value_loss, policy_loss))
 
             ##################################################
             ###            Immitation Learning             ###

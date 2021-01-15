@@ -53,13 +53,14 @@ if __name__ == '__main__':
     # rl settings
     parser.add_argument('--reward_config', default='models/config/rewards.json')
     parser.add_argument('--smooth_nav', dest='smooth_nav', action='store_true', help='smooth nav actions (might be required based on training data)')
-    parser.add_argument('--num_rollout_threads', type=int, default=2, help='number of threads collecting rollouts')
+    parser.add_argument('--num_rollout_threads', type=int, default=4, help='number of threads collecting rollouts')
 
     # rl parameters
     parser.add_argument('--max_steps', type=int, default=100, help='max steps before episode termination')
     parser.add_argument('--max_fails', type=int, default=10, help='max API execution failures before episode termination')
-    parser.add_argument('--episodes_per_epoch', type=int, default=2, help='number of episodes to gather each epoch for reinforcement learning')
+    parser.add_argument('--episodes_per_epoch', type=int, default=4, help='number of episodes to gather each epoch for reinforcement learning')
     parser.add_argument('--batches_per_epoch', type=int, default=1, help='max number of immitation learning batches for each epoch')
+    parser.add_argument('--ppo_batch', type=int, default=2, help='number of rollouts in each ppo batch')
     parser.add_argument('--gamma', type=float, default=0.99, help='return discount factor')
     parser.add_argument('--epsilon', type=float, default=0.2, help='PPO trust region parameter')
     parser.add_argument('--value_constant', type=float, default=1, help='PPO value loss scalar')
