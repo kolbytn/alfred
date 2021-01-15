@@ -508,8 +508,8 @@ class ThorEnv(Controller):
                 x, y = nz_rows[i], nz_cols[i]
                 instance = tuple(instance_segs[x, y])
                 instance_counter[instance] += 1
-            if debug:
-                print("action_box", "instance_counter", instance_counter)
+            # if debug:
+            #     print("action_box", "instance_counter", instance_counter)
 
             # iou scores for all instances
             iou_scores = {}
@@ -525,20 +525,20 @@ class ThorEnv(Controller):
                        if color_id in color_to_object_id and color_to_object_id[color_id] != inv_obj]
 
             # print all ids
-            if debug:
-                print("action_box", "all_ids", all_ids)
+            # if debug:
+            #     print("action_box", "all_ids", all_ids)
 
             # print instance_ids
             instance_ids = [inst_id for inst_id in all_ids if inst_id is not None]
-            if debug:
-                print("action_box", "instance_ids", instance_ids)
+            # if debug:
+            #     print("action_box", "instance_ids", instance_ids)
 
             # prune invalid instances like floors, walls, etc.
             instance_ids = self.prune_by_any_interaction(instance_ids)
 
             # cv2 imshows to show image, segmentation mask, interact mask
-            if debug:
-                print("action_box", "instance_ids", instance_ids)
+            # if debug:
+                # print("action_box", "instance_ids", instance_ids)
                 # instance_seg = copy.copy(instance_segs)
                 # instance_seg[:, :, :] = interact_mask[:, :, np.newaxis] == 1
                 # instance_seg *= 255
@@ -568,7 +568,7 @@ class ThorEnv(Controller):
         if not event.metadata['lastActionSuccess']:
             if interact_mask is not None and debug:
                 print("Failed to execute action!", action, target_instance_id)
-                print("all_ids inside BBox: " + str(all_ids))
+                # print("all_ids inside BBox: " + str(all_ids))
                 # instance_seg = copy.copy(instance_segs)
                 # instance_seg[:, :, :] = interact_mask[:, :, np.newaxis] == 1
                 # cv2.imshow('seg', instance_segs)

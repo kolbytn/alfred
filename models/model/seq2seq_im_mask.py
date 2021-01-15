@@ -293,7 +293,12 @@ class Module(Base):
         '''
 
         # construct distributions
-        action_low_dist = nn.functional.softmax(feat['out_action_low'].squeeze())
+        cleaned_action_out = feat['out_action_low'].squeeze()
+        cleaned_action_out[0] = 0
+        cleaned_action_out[1] = 0
+        cleaned_action_out[2] = 0
+
+        action_low_dist = nn.functional.softmax(cleaned_action_out)
         action_low_mask_dist = F.sigmoid(feat['out_action_low_mask'].squeeze())
         mask_shape = action_low_mask_dist.shape
         action_low_mask_dist = torch.stack([1 - action_low_mask_dist, action_low_mask_dist], dim=-1)
@@ -307,10 +312,10 @@ class Module(Base):
         action_low_mask_prob = torch.prod(torch.gather(action_low_mask_dist, -1, action_low_mask.unsqueeze(-1))).unsqueeze(0)
 
         # index to API actions
-        words = self.vocab['action_low'].index2word(action_low_idx)
+        word = self.vocab['action_low'].index2word(action_low_idx)
 
         pred = {
-            'action_low': ' '.join(words),
+            'action_low': word,
             'action_low_dist': action_low_dist,
             'action_low_idx': action_low_idx,
             'action_low_prob': action_low_prob,
