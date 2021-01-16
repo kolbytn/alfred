@@ -13,11 +13,11 @@ from gen.utils.image_util import decompress_mask
 
 class Module(Base):
 
-    def __init__(self, args, vocab):
+    def __init__(self, args, vocab, manager=None):
         '''
         Seq2Seq agent
         '''
-        super().__init__(args, vocab)
+        super().__init__(args, vocab, manager)
 
         # encoder and self-attention
         self.enc = nn.LSTM(args.demb, args.dhid, bidirectional=True, batch_first=True)
@@ -239,7 +239,7 @@ class Module(Base):
         e_t = self.embed_action(prev_action) if prev_action is not None else self.r_state['e_t']
 
         # decode and save embedding and hidden states
-        out_action_low, out_action_low_mask, state_t, *_ = self.dec.step(self.r_state['enc_lang'], feat['frames'][:, 0], e_t=e_t, state_tm1=self.r_state['state_t'])
+        out_action_low, out_action_low_mask, state_t, out_value, *_ = self.dec.step(self.r_state['enc_lang'], feat['frames'][:, 0], e_t=e_t, state_tm1=self.r_state['state_t'])
 
         # save states
         self.r_state['state_t'] = state_t
@@ -248,6 +248,7 @@ class Module(Base):
         # output formatting
         feat['out_action_low'] = out_action_low.unsqueeze(0)
         feat['out_action_low_mask'] = out_action_low_mask.unsqueeze(0)
+        feat['out_value'] = out_value.unsqueeze(0)
         return feat
 
 
@@ -282,6 +283,47 @@ class Module(Base):
                 'action_low': ' '.join(words),
                 'action_low_mask': p_mask,
             }
+
+        return pred
+
+
+    def sample_pred(self, feat):
+        '''
+        output processing
+        '''
+
+        # construct distributions
+        cleaned_action_out = feat['out_action_low'].squeeze()
+        cleaned_action_out[0] = 0
+        cleaned_action_out[1] = 0
+        cleaned_action_out[2] = 0
+
+        action_low_dist = nn.functional.softmax(cleaned_action_out)
+        action_low_mask_dist = F.sigmoid(feat['out_action_low_mask'].squeeze())
+        mask_shape = action_low_mask_dist.shape
+        action_low_mask_dist = torch.stack([1 - action_low_mask_dist, action_low_mask_dist], dim=-1)
+
+        # sample actions
+        action_low_idx = torch.multinomial(action_low_dist, 1)
+        action_low_mask = torch.multinomial(action_low_mask_dist.view(-1, 2), 1).reshape(mask_shape)
+
+        # calculate probabilities
+        action_low_prob = action_low_dist[action_low_idx]
+        action_low_mask_prob = torch.prod(torch.gather(action_low_mask_dist, -1, action_low_mask.unsqueeze(-1))).unsqueeze(0)
+
+        # index to API actions
+        word = self.vocab['action_low'].index2word(action_low_idx)
+
+        pred = {
+            'action_low': word,
+            'action_low_dist': action_low_dist,
+            'action_low_idx': action_low_idx,
+            'action_low_prob': action_low_prob,
+            'action_low_mask': (action_low_mask > 0).cpu().numpy(),
+            'action_low_mask_dist': action_low_mask_dist,
+            'action_low_mask_idx': action_low_mask,
+            'action_low_mask_prob': action_low_mask_prob,
+        }
 
         return pred
 
@@ -341,10 +383,6 @@ class Module(Base):
             losses['progress_aux'] = self.args.pm_aux_loss_wt * progress_loss
 
         return losses
-
-
-    def rl_update(self, rollouts):
-        pass
 
 
     def weighted_mask_loss(self, pred_masks, gt_masks):

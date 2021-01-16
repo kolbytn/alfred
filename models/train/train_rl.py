@@ -6,6 +6,7 @@ sys.path.append(os.path.join(os.environ['ALFRED_ROOT'], 'models'))
 
 import os
 import torch
+import torch.multiprocessing as mp
 import pprint
 import json
 from data.preprocess import Dataset
@@ -15,6 +16,10 @@ from models.utils.helper_utils import optimizer_to
 
 
 if __name__ == '__main__':
+    # multiprocessing settings
+    mp.set_start_method('spawn')
+    manager = mp.Manager()
+
     # parser
     parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
 
@@ -48,12 +53,19 @@ if __name__ == '__main__':
     # rl settings
     parser.add_argument('--reward_config', default='models/config/rewards.json')
     parser.add_argument('--smooth_nav', dest='smooth_nav', action='store_true', help='smooth nav actions (might be required based on training data)')
+    parser.add_argument('--num_rollout_threads', type=int, default=4, help='number of threads collecting rollouts')
 
     # rl parameters
     parser.add_argument('--max_steps', type=int, default=100, help='max steps before episode termination')
     parser.add_argument('--max_fails', type=int, default=10, help='max API execution failures before episode termination')
-    parser.add_argument('--episodes_per_epoch', type=int, default=1, help='number of episodes to gather each epoch for reinforcement learning')
+    parser.add_argument('--episodes_per_epoch', type=int, default=4, help='number of episodes to gather each epoch for reinforcement learning')
     parser.add_argument('--batches_per_epoch', type=int, default=1, help='max number of immitation learning batches for each epoch')
+    parser.add_argument('--ppo_batch', type=int, default=2, help='number of rollouts in each ppo batch')
+    parser.add_argument('--gamma', type=float, default=0.99, help='return discount factor')
+    parser.add_argument('--epsilon', type=float, default=0.2, help='PPO trust region parameter')
+    parser.add_argument('--value_constant', type=float, default=1, help='PPO value loss scalar')
+    parser.add_argument('--policy_constant', type=float, default=1, help='PPO policy loss scalar')
+    parser.add_argument('--ppo_epochs', type=int, default=5, help='number of epochs to run on PPO step')
     parser.add_argument('--validation_frequency', type=int, default=10, help='frequency of doing validation during training')
     parser.add_argument('--validation_episodes', type=int, default=20, help='number of episodes per validation')
 
@@ -112,7 +124,7 @@ if __name__ == '__main__':
         print("Loading: " + args.resume)
         model, optimizer = M.Module.load(args.resume)
     else:
-        model = M.Module(args, vocab)
+        model = M.Module(args, vocab, manager)
         optimizer = None
 
     # to gpu
