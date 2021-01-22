@@ -1,5 +1,4 @@
-<<<<<<< HEAD
 **/__pycache__/
-=======
-__pycache__
->>>>>>> 97c1031b0e26e9666afe6984b2744f02078dec92
+venv
+data/json_feat_*
+exp
