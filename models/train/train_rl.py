@@ -53,7 +53,8 @@ if __name__ == '__main__':
     # rl settings
     parser.add_argument('--reward_config', default='models/config/rewards.json')
     parser.add_argument('--smooth_nav', dest='smooth_nav', action='store_true', help='smooth nav actions (might be required based on training data)')
-    parser.add_argument('--num_rollout_threads', type=int, default=4, help='number of threads collecting rollouts')
+    parser.add_argument('--num_rollout_processes', type=int, default=2, help='number of processes collecting rollouts')
+    parser.add_argument('--num_valid_processes', type=int, default=2, help='number of processes doing validation')
 
     # rl parameters
     parser.add_argument('--max_steps', type=int, default=100, help='max steps before episode termination')
@@ -85,7 +86,8 @@ if __name__ == '__main__':
 
     # debugging
     parser.add_argument('--debug', dest='debug', action='store_true')
-    parser.add_argument('--fast_epoch', help='fast epoch during debugging', action='store_true')
+    parser.add_argument('--small_train', help='fast epoch during debugging', action='store_true')
+    parser.add_argument('--small_valid', help='fast valid during debugging', action='store_true')
     parser.add_argument('--dataset_fraction', help='use fraction of the dataset for debugging (0 indicates full size)', default=0, type=int)
     parser.add_argument('--video_output_path', help='path for validation video files', default='data/validation_video/videos/', type=str)
     parser.add_argument('--video_fps', help='path for validation video fps', default=5, type=int)

@@ -13,10 +13,12 @@ from tensorboardX import SummaryWriter
 from tqdm import trange
 import time
 from importlib import import_module
+import queue
+import csv
 
 from env.thor_env import ThorEnv
 from models.nn.resnet import Resnet
-from utils.video_record import VideoRecord
+from models.utils.video_record import VideoRecord
 
 
 from multiprocessing import Process
@@ -96,10 +98,11 @@ class Module(nn.Module):
             valid_unseen = valid_unseen[:small_valid_size]
 
         # debugging: use to check if training loop works without waiting for full epoch
-        if self.args.fast_epoch:
+        if self.args.small_train:
             train = train[:16]
-            valid_seen = valid_seen[:16]
-            valid_unseen = valid_unseen[:16]
+        if self.args.small_valid:
+            valid_seen = valid_seen[:1]
+            valid_unseen = valid_unseen[:1]
 
         # initialize summary writer for tensorboardX
         self.summary_writer = SummaryWriter(log_dir=self.args.dout)
@@ -112,19 +115,46 @@ class Module(nn.Module):
         # optimizer
         optimizer = optimizer or torch.optim.Adam(self.parameters(), lr=self.args.lr)
 
-        # rollout thread model
+        # Rollout processes
         if self.args.episodes_per_epoch > 0:
             M = import_module('model.{}'.format(self.args.model))
-            thread_model = M.Module(self.args, self.vocab)
-            thread_model.share_memory()
-            thread_model.to(device)
-            task_queue = self.manager.Queue()
-            rollouts = self.manager.Queue()
-            threads = []
-            for _ in range(self.args.num_rollout_threads):
-                thread = mp.Process(target=Module.run_rollouts, args=(thread_model, task_queue, rollouts, self.args))
-                thread.start()
-                threads.append(thread)
+            rollout_model = M.Module(self.args, self.vocab)
+            rollout_model.share_memory()
+            rollout_model.to(device)
+            rollout_task_queue = self.manager.Queue()
+            rollout_results = self.manager.Queue()
+            rollout_processes = []
+            for _ in range(self.args.num_rollout_processes):
+                p = mp.Process(target=Module.run_rollouts, args=(rollout_model, rollout_task_queue, rollout_results, self.args))
+                p.start()
+                rollout_processes.append(p)
+
+        # Validation processes
+        M = import_module('model.{}'.format(self.args.model))
+        valid_model = M.Module(self.args, self.vocab)
+        valid_model.share_memory()
+        valid_model.to(device)
+        valid_task_queue = self.manager.Queue()
+        valid_results = self.manager.Queue()
+        valid_processes = []
+        for _ in range(self.args.num_valid_processes):
+            p = mp.Process(target=Module.run_rollouts, args=(valid_model, valid_task_queue, valid_results, self.args, True))
+            p.start()
+            valid_processes.append(p)
+        for traj in valid_seen:
+            valid_task_queue.put((traj, True))
+        for traj in valid_unseen:
+            valid_task_queue.put((traj, False))
+        valid_completed = []
+        train_start_time = time.time()
+        valid_time = time.time()
+        valid_epoch = 0
+
+        # Create logging
+        print("Saving to: %s" % self.args.dout) 
+        valid_results_csv = os.path.join(self.args.dout, 'valid_results.csv')
+        f = open(valid_results_csv, 'w+')
+        f.close()
 
         fsave = os.path.join(self.args.dout, 'latest.pth')
         torch.save({
@@ -135,33 +165,34 @@ class Module(nn.Module):
             'vocab': self.vocab,
         }, fsave)
 
-        # display dout
-        print("Saving to: %s" % self.args.dout)
-        # best_loss = {'train': 1e10, 'valid_seen': 1e10, 'valid_unseen': 1e10}
-        mean_reward = {'train': 0, 'valid_seen': 0, 'valid_unseen': 0}
-
-        train_iter, valid_seen_iter, valid_unseen_iter = 0, 0, 0
-        mean_valid_seen_reward = None
-        mean_valid_unseen_reward = None
+        best_results = {
+            'sr_seen': None,
+            'plw_sr_seen': None,
+            'gc_seen': None,
+            'plw_gc_seen': None,
+            'sr_unseen': None,
+            'plw_sr_unseen': None,
+            'gc_unseen': None,
+            'plw_gc_unseen': None
+        }
 
         for epoch in trange(0, self.args.epoch, desc='epoch'):
-            self.train()
-
+                
             ##################################################
             ###           Reinforcement Learning           ###
             ##################################################
-            # print("==========================REINFORCEMENT LEARNING==========================")
+            self.train()
             if self.args.episodes_per_epoch > 0:
 
                 ############### Collect Rollouts #################
-                thread_model.load_state_dict(self.state_dict())
+                rollout_model.load_state_dict(self.state_dict())
                 
                 for traj in random.sample(train, self.args.episodes_per_epoch):
-                    task_queue.put(traj)
+                    rollout_task_queue.put(traj)
 
                 completed_rollouts = []
                 while len(completed_rollouts) < self.args.episodes_per_epoch:
-                    rollout = rollouts.get()
+                    rollout = rollout_results.get()
 
                     discounted = 0
                     for i in reversed(range(len(rollout))):
@@ -248,8 +279,7 @@ class Module(nn.Module):
             ##################################################
             ###            Immitation Learning             ###
             ##################################################
-
-            # print("==========================IMITATION LEARNING==========================")
+            self.train()
 
             m_train = collections.defaultdict(list)
             self.adjust_lr(optimizer, self.args.lr, epoch, decay_epoch=self.args.decay_epoch)
@@ -266,7 +296,7 @@ class Module(nn.Module):
                 for k, v in loss.items():
                     ln = 'loss_' + k
                     m_train[ln].append(v.item())
-                    self.summary_writer.add_scalar('train/' + ln, v.item(), train_iter)
+                    self.summary_writer.add_scalar('train/' + ln, v.item(), epoch)
 
                 # optimizer backward pass
                 optimizer.zero_grad()
@@ -274,201 +304,132 @@ class Module(nn.Module):
                 sum_loss.backward()
                 optimizer.step()
 
-                self.summary_writer.add_scalar('train/loss', sum_loss, train_iter)
+                self.summary_writer.add_scalar('train/loss', sum_loss, epoch)
                 sum_loss = sum_loss.detach().cpu()
                 total_train_loss.append(float(sum_loss))
-                train_iter += self.args.batch
 
             ##################################################
             ###                 Validation                 ###
             ##################################################
-
-            # # NOTE: Original Implementation: predict action and compute loss
-            # # compute metrics for train (too memory heavy!)
-            # m_train = {k: sum(v) / len(v) for k, v in m_train.items()}
-            # m_train.update(self.compute_metric(p_train, train))
-            # m_train['total_loss'] = sum(total_train_loss) / len(total_train_loss)
-            # self.summary_writer.add_scalar('train/total_loss', m_train['total_loss'], train_iter)
-
-            # # compute metrics for valid_seen
-            # p_valid_seen, valid_seen_iter, total_valid_seen_loss, m_valid_seen = self.run_pred(valid_seen, args=self.args, name='valid_seen', iter=valid_seen_iter)
-            # m_valid_seen.update(self.compute_metric(p_valid_seen, valid_seen))
-            # m_valid_seen['total_loss'] = float(total_valid_seen_loss)
-            # self.summary_writer.add_scalar('valid_seen/total_loss', m_valid_seen['total_loss'], valid_seen_iter)
-
-            # # compute metrics for valid_unseen
-            # p_valid_unseen, valid_unseen_iter, total_valid_unseen_loss, m_valid_unseen = self.run_pred(valid_unseen, args=self.args, name='valid_unseen', iter=valid_unseen_iter)
-            # m_valid_unseen.update(self.compute_metric(p_valid_unseen, valid_unseen))
-            # m_valid_unseen['total_loss'] = float(total_valid_unseen_loss)
-            # self.summary_writer.add_scalar('valid_unseen/total_loss', m_valid_unseen['total_loss'], valid_unseen_iter)
-
-
-            # # NOTE: RL implementation: rollout and record trajectory
-            if (epoch + 1) % self.args.validation_frequency == 0:
-                print("==========================VALIDATION==========================")
-                
-                # sampled = random.sample(valid_seen, self.args.validation_episodes // 2)              # seen envs
-                # sampled.extend(random.sample(valid_unseen, self.args.validation_episodes // 2))      # unseen envs
-                sampled = valid_seen + valid_unseen
-                print(sampled)
-                total_rewards = [] # 1st half: seen, 2nd half: unseen
-                
-                for i, task in enumerate(sampled):
-
-                    # reset model
-                    self.reset()
-
-                    # setup scene
-                    traj_data = self.load_task_json(task)
-                    r_idx = task['repeat_idx']
-                    
-
-                    self.setup_scene(env, traj_data, r_idx, self.args)
-
-                    feat = self.featurize([traj_data], load_frames=False, load_mask=False)
-
-                    done = False
-                    fails = 0
-                    total_reward = 0
-                    num_steps = 0
-
-                    # initialize video recording
-                    task_name = '_'.join(('_'.join(str(datetime.now()).split(':')) + '_' + task['task']).split('/'))
-                    print("video recording: (", task_name, ") created at:", self.args.video_output_path)
-                    video_recording = VideoRecord(self.args.video_output_path, task_name, self.args.video_fps)
-
-                    while not done and num_steps < self.args.max_steps:
-
-                        # extract visual features
-                        curr_image = Image.fromarray(np.uint8(env.last_event.frame))
-                        feat['frames'] = self.resnet.featurize([curr_image], batch=1).unsqueeze(0)
-
-                        # record video using last observation
-                        video_recording.record_frame(env.last_event.frame)
-
-                        # forward model
-                        m_out = self.step(feat)
-                        m_pred = self.extract_preds(m_out, [traj_data], feat, clean_special_tokens=False)
-                        m_pred = list(m_pred.values())[0]
-
-                        # # check if <<stop>> was predicted
-                        # if m_pred['action_low'] == "<<stop>>":
-                        #     print("\tpredicted STOP")
-                        #     break
-
-                        # get action and mask
-                        action, mask = m_pred['action_low'], m_pred['action_low_mask'][0]
-                        mask = np.squeeze(mask, axis=0) if self.has_interaction(action) else None
-
-                        # use predicted action and mask (if available) to interact with the env
-                        t_success, _, _, err, _ = env.va_interact(action, interact_mask=mask, smooth_nav=self.args.smooth_nav, debug=self.args.debug)
-
-                        # if not t_success:
-                        #     fails += 1
-                        #     if fails >= self.args.max_fails:
-                        #         print("Interact API failed %d times" % fails + "; latest error '%s'" % err)
-                        #         break
-
-                        # next time-step
-                        reward, done = env.get_transition_reward()
-                        total_reward += reward
-                        num_steps += 1
-                    
-                    total_rewards.append(total_reward)
-                    video_recording.savemp4()
-                
-                mean_valid_seen_reward = sum(total_rewards[:(len(total_rewards)//2)]) / (len(total_rewards) // 2)
-                mean_valid_unseen_reward = sum(total_rewards[(len(total_rewards)//2):]) / (len(total_rewards) // 2)
             
-                ##################################################
-                ###                   Logging                  ###
-                ##################################################
+            while True:
+                try:
+                    valid_completed.append(valid_results.get_nowait())
+                except queue.Empty:
+                    break
 
-                # print("==========================LOGGING==========================")
+            if len(valid_completed) == len(valid_seen) + len(valid_unseen):
+                # Count results
+                def count_results(results, seen):
+                    successes = 0
+                    completed_goal_conditions = 0
+                    total_goal_conditions = 0
+                    path_len_weighted_success_spl = 0
+                    path_len_weighted_goal_condition_spl = 0
+                    path_len_weight = 0
+                    for log_result in valid_completed:
+                        if log_result['seen'] == seen:
+                            successes += log_result['goal_satisfied']
+                            completed_goal_conditions += log_result['completed_goal_conditions']
+                            total_goal_conditions += log_result['total_goal_conditions']
+                            path_len_weighted_success_spl += log_result['path_len_weighted_success_spl']
+                            path_len_weighted_goal_condition_spl += log_result['path_len_weighted_goal_condition_spl']
+                            path_len_weight += log_result['path_len_weight']
+                    sr = successes / len(valid_seen) if seen else successes / len(valid_unseen)
+                    plw_sr = path_len_weighted_success_spl / path_len_weight
+                    gc = completed_goal_conditions / total_goal_conditions
+                    plw_gc = path_len_weighted_goal_condition_spl / path_len_weight
+                    return sr, plw_sr, gc, plw_gc
 
-                stats = {'epoch': epoch,
-                        'valid_seen': (mean_valid_seen_reward),
-                        'valid_unseen': (mean_valid_unseen_reward)}
+                sr_seen, plw_sr_seen, gc_seen, plw_gc_seen = count_results(valid_completed, True)
+                sr_unseen, plw_sr_unseen, gc_unseen, plw_gc_unseen = count_results(valid_completed, True)
+                valid_summary_list = [valid_epoch, valid_time - train_start_time, sr_seen, plw_sr_seen, gc_seen, 
+                                      plw_gc_seen, sr_unseen, plw_sr_unseen, gc_unseen, plw_gc_unseen,]
+                valid_summary_dict = {
+                    'epoch': valid_epoch, 
+                    'time': valid_time - train_start_time,
+                    'sr_seen': sr_seen,
+                    'plw_sr_seen': plw_sr_seen,
+                    'gc_seen': gc_seen,
+                    'plw_gc_seen': plw_gc_seen,
+                    'sr_unseen': sr_unseen,
+                    'plw_sr_unseen': plw_sr_unseen,
+                    'gc_unseen': gc_unseen,
+                    'plw_gc_unseen': plw_gc_unseen,
+                }
 
-                # check reward if better then save
-                # new best valid_seen loss
-                if mean_valid_seen_reward is not None and mean_valid_seen_reward > mean_reward['valid_seen']:
-                    print('\nFound new best valid_seen!! Saving...')
-                    fsave = os.path.join(self.args.dout, 'best_seen.pth')
+                # Log results
+                with open(valid_results_csv, 'a') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(valid_summary_list)
+
+                new_bests = []
+                new_bests.append('sr_seen' if best_results['sr_seen'] is None or sr_seen > best_results['sr_seen'] else None)
+                new_bests.append('plw_sr_seen' if best_results['plw_sr_seen'] is None or plw_sr_seen > best_results['plw_sr_seen'] else None)
+                new_bests.append('gc_seen' if best_results['gc_seen'] is None or gc_seen > best_results['gc_seen'] else None)
+                new_bests.append('plw_gc_seen' if best_results['plw_gc_seen'] is None or plw_gc_seen > best_results['plw_gc_seen'] else None)
+                new_bests.append('sr_unseen' if best_results['sr_unseen'] is None or sr_unseen > best_results['sr_unseen'] else None)
+                new_bests.append('plw_sr_unseen' if best_results['plw_sr_unseen'] is None or plw_sr_unseen > best_results['plw_sr_unseen'] else None)
+                new_bests.append('gc_unseen' if best_results['gc_unseen'] is None or gc_unseen > best_results['gc_unseen'] else None)
+                new_bests.append('plw_gc_unseen' if best_results['plw_gc_unseen'] is None or plw_gc_unseen > best_results['plw_gc_unseen'] else None)
+
+                for filename in new_bests:
+                    if filename is None:
+                        continue
+                    fsave = os.path.join(self.args.dout, 'best_{}.pth'.format(filename))
                     torch.save({
-                        'metric': stats,
+                        'metric': valid_summary_dict,
                         'model': self.state_dict(),
                         'optim': optimizer.state_dict(),
                         'args': self.args,
                         'vocab': self.vocab,
                     }, fsave)
-                    fbest = os.path.join(self.args.dout, 'best_seen.json')
+                    fbest = os.path.join(self.args.dout, 'best_{}.json'.format(filename))
                     with open(fbest, 'wt') as f:
-                        json.dump(stats, f, indent=2)
+                        json.dump(valid_completed, f, indent=2)
+                    best_results[filename] = valid_summary_dict[filename]
 
-                    # fpred = os.path.join(args.dout, 'valid_seen.debug.preds.json')
-                    # with open(fpred, 'wt') as f:
-                    #     json.dump(self.make_debug(p_valid_seen, valid_seen), f, indent=2)
-                    mean_reward['valid_seen'] = mean_valid_seen_reward
+                # Restart validation
+                valid_model.load_state_dict(self.state_dict())
+                for traj in valid_seen:
+                    valid_task_queue.put((traj, True))
+                for traj in valid_unseen:
+                    valid_task_queue.put((traj, False))
+                valid_completed = []
+                valid_time = time.time()
+                valid_epoch = epoch
 
-                # new best valid_unseen loss
-                if mean_valid_unseen_reward is not None and mean_valid_unseen_reward < mean_reward['valid_unseen']:
-                    print('Found new best valid_unseen!! Saving...')
-                    fsave = os.path.join(self.args.dout, 'best_unseen.pth')
-                    torch.save({
-                        'metric': stats,
-                        'model': self.state_dict(),
-                        'optim': optimizer.state_dict(),
-                        'args': self.args,
-                        'vocab': self.vocab,
-                    }, fsave)
-                    fbest = os.path.join(self.args.dout, 'best_unseen.json')
-                    with open(fbest, 'wt') as f:
-                        json.dump(stats, f, indent=2)
+            # Save the latest checkpoint
+            if self.args.save_every_epoch:
+                fsave = os.path.join(self.args.dout, 'epoch_{}.pth'.format(epoch))
+            else:
+                fsave = os.path.join(self.args.dout, 'latest.pth')
+            torch.save({
+                'metric': dict(),
+                'model': self.state_dict(),
+                'optim': optimizer.state_dict(),
+                'args': self.args,
+                'vocab': self.vocab,
+            }, fsave)
 
-                    # fpred = os.path.join(self.args.dout, 'valid_unseen.debug.preds.json')
-                    # with open(fpred, 'wt') as f:
-                    #     json.dump(self.make_debug(p_valid_unseen, valid_unseen), f, indent=2)
-                    mean_reward['valid_unseen'] = mean_valid_unseen_reward
-
-
-
-                # save the latest checkpoint
-                if self.args.save_every_epoch:
-                    fsave = os.path.join(self.args.dout, 'net_epoch_%d.pth' % epoch)
-                else:
-                    fsave = os.path.join(self.args.dout, 'latest.pth')
-                torch.save({
-                    'metric': stats,
-                    'model': self.state_dict(),
-                    'optim': optimizer.state_dict(),
-                    'args': self.args,
-                    'vocab': self.vocab,
-                }, fsave)
-
-                ## debug action output json for train
-                # fpred = os.path.join(self.args.dout, 'train.debug.preds.json')
-                # with open(fpred, 'wt') as f:
-                #     json.dump(self.make_debug(p_train, train), f, indent=2)
-
-                # write stats
-                for split in stats.keys():
-                    if isinstance(stats[split], dict):
-                        for k, v in stats[split].items():
-                            self.summary_writer.add_scalar(split + '/' + k, v, train_iter)
-                pprint.pprint(stats)
-
-        for _ in range(len(threads)):
-            task_queue.put(None)
-        for t in threads:
-            t.join()
+        for _ in range(len(rollout_processes)):
+            rollout_task_queue.put(None)
+        for _ in range(len(valid_processes) // 2):
+            valid_task_queue.put(None)
+        for p in rollout_processes:
+            p.join()
+        for p in valid_processes:
+            p.join()
 
     @classmethod
-    def run_rollouts(cls, model, task_queue, rollouts, args):
+    def run_rollouts(cls, model, task_queue, results, args, validation=False):
         env = ThorEnv()
 
         while True:
-            task = task_queue.get()
+            if validation:
+                task, seen = task_queue.get()
+            else:
+                task = task_queue.get()
             if task is None:
                 break
 
@@ -520,20 +481,56 @@ class Module(nn.Module):
                 total_reward += reward
                 num_steps += 1
 
-                curr_rollout.append({
-                    'frames': feat['frames'].cpu().detach().numpy(),
-                    'lang_goal_instr_data': feat['lang_goal_instr'].data.cpu().detach().numpy(),
-                    'lang_goal_instr_batch': feat['lang_goal_instr'].batch_sizes.cpu().detach().numpy(),
-                    'lang_goal_instr_sorted': feat['lang_goal_instr'].sorted_indices.cpu().detach().numpy() if feat['lang_goal_instr'].sorted_indices is not None else None,
-                    'lang_goal_instr_unsorted': feat['lang_goal_instr'].unsorted_indices.cpu().detach().numpy() if feat['lang_goal_instr'].unsorted_indices is not None else None,
-                    'action_dist': pred['action_low_dist'].cpu().detach().numpy(),
-                    'action_mask_dist': pred['action_low_mask_dist'].cpu().detach().numpy(),
-                    'action_idx': pred['action_low_idx'].cpu().detach().numpy(),
-                    'action_mask_idx': pred['action_low_mask_idx'].cpu().detach().numpy(),
-                    'reward': np.array([reward])
-                })
+                if not validation:
+                    curr_rollout.append({
+                        'frames': feat['frames'].cpu().detach().numpy(),
+                        'lang_goal_instr_data': feat['lang_goal_instr'].data.cpu().detach().numpy(),
+                        'lang_goal_instr_batch': feat['lang_goal_instr'].batch_sizes.cpu().detach().numpy(),
+                        'lang_goal_instr_sorted': feat['lang_goal_instr'].sorted_indices.cpu().detach().numpy() if feat['lang_goal_instr'].sorted_indices is not None else None,
+                        'lang_goal_instr_unsorted': feat['lang_goal_instr'].unsorted_indices.cpu().detach().numpy() if feat['lang_goal_instr'].unsorted_indices is not None else None,
+                        'action_dist': pred['action_low_dist'].cpu().detach().numpy(),
+                        'action_mask_dist': pred['action_low_mask_dist'].cpu().detach().numpy(),
+                        'action_idx': pred['action_low_idx'].cpu().detach().numpy(),
+                        'action_mask_idx': pred['action_low_mask_idx'].cpu().detach().numpy(),
+                        'reward': np.array([reward])
+                    })
 
-            rollouts.put(curr_rollout)
+            if validation:
+                # check if goal was satisfied
+                goal_satisfied = env.get_goal_satisfied()
+
+                # goal_conditions
+                pcs = env.get_goal_conditions_met()
+                goal_condition_success_rate = pcs[0] / float(pcs[1])
+
+                # SPL
+                path_len_weight = len(traj_data['plan']['low_actions'])
+                s_spl = (1 if goal_satisfied else 0) * min(1., path_len_weight / float(num_steps))
+                pc_spl = goal_condition_success_rate * min(1., path_len_weight / float(num_steps))
+
+                # path length weighted SPL
+                plw_s_spl = s_spl * path_len_weight
+                plw_pc_spl = pc_spl * path_len_weight
+
+                # log success/fails
+                log_entry = {'trial': traj_data['task_id'],
+                            'type': traj_data['task_type'],
+                            'repeat_idx': int(r_idx),
+                            'seen': seen,
+                            'goal_instr': traj_data['turk_annotations']['anns'][r_idx]['task_desc'],
+                            'goal_satisfied': goal_satisfied,
+                            'completed_goal_conditions': int(pcs[0]),
+                            'total_goal_conditions': int(pcs[1]),
+                            'goal_condition_success': float(goal_condition_success_rate),
+                            'success_spl': float(s_spl),
+                            'path_len_weighted_success_spl': float(plw_s_spl),
+                            'goal_condition_spl': float(pc_spl),
+                            'path_len_weighted_goal_condition_spl': float(plw_pc_spl),
+                            'path_len_weight': int(path_len_weight),
+                            'reward': float(total_reward)}
+                results.put(log_entry)
+            else:
+                results.put(curr_rollout)
         env.stop()
 
     def run_pred(self, dev, args=None, name='dev', iter=0):
@@ -580,9 +577,6 @@ class Module(nn.Module):
         raise NotImplementedError()
 
     def compute_metric(self, preds, data):
-        raise NotImplementedError()
-
-    def rl_update(self, rollouts):
         raise NotImplementedError()
 
     def get_task_and_ann_id(self, ex):
