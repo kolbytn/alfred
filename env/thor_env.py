@@ -51,7 +51,7 @@ class ThorEnv(Controller):
         '''
         reset scene and task states
         '''
-        print("Resetting ThorEnv")
+        # print("Resetting ThorEnv")
 
         if type(scene_name_or_num) == str:
             scene_name = scene_name_or_num

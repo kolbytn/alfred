@@ -10,7 +10,6 @@ from torch import nn
 import torch.multiprocessing as mp
 from torch.utils.data import Dataset, DataLoader
 from tensorboardX import SummaryWriter
-from tqdm import trange
 import time
 from importlib import import_module
 import queue
@@ -101,8 +100,8 @@ class Module(nn.Module):
         if self.args.small_train:
             train = train[:16]
         if self.args.small_valid:
-            valid_seen = valid_seen[:1]
-            valid_unseen = valid_unseen[:1]
+            valid_seen = valid_seen[:8]
+            valid_unseen = valid_unseen[:8]
 
         # initialize summary writer for tensorboardX
         self.summary_writer = SummaryWriter(log_dir=self.args.dout)
@@ -176,7 +175,7 @@ class Module(nn.Module):
             'plw_gc_unseen': None
         }
 
-        for epoch in trange(0, self.args.epoch, desc='epoch'):
+        for epoch in range(0, self.args.epoch):
                 
             ##################################################
             ###           Reinforcement Learning           ###
@@ -190,15 +189,21 @@ class Module(nn.Module):
                 for traj in random.sample(train, self.args.episodes_per_epoch):
                     rollout_task_queue.put(traj)
 
+                total_rewards = []
+                policy_losses = []
+                value_losses = []
                 completed_rollouts = []
                 while len(completed_rollouts) < self.args.episodes_per_epoch:
                     rollout = rollout_results.get()
 
+                    total_reward = 0
                     discounted = 0
                     for i in reversed(range(len(rollout))):
                         discounted = self.args.gamma * discounted + rollout[i]['reward']
                         rollout[i]['ret'] = discounted
+                        total_reward += rollout[i]['reward'].item()
                     completed_rollouts.append(rollout)
+                    total_rewards.append(total_reward)
 
                 for _ in range(self.args.ppo_epochs):
 
@@ -270,11 +275,19 @@ class Module(nn.Module):
                         right = torch.clamp(ratio, 1 - self.args.epsilon, 1 + self.args.epsilon) * advantage
                         policy_loss = self.args.policy_constant * -torch.mean(torch.min(left, right))
 
+                        value_losses.append(value_loss.item())
+                        policy_losses.append(policy_loss.item())
+
                         loss = value_loss + policy_loss
                         loss.backward()
                         optimizer.step()
-                        print("PPO Step... Value Loss: {:.2f}, Polcy Loss: {:.2f}".format(
-                              value_loss, policy_loss))
+
+                print("PPO Epoch: {} Time: {:.0f} Reward: {:.2f} Value Loss: {:.2f} Polcy Loss: {:.2f}".format(
+                        epoch,
+                        time.time() - train_start_time,
+                        sum(total_rewards) / len(total_rewards), 
+                        sum(value_losses) / len(value_losses), 
+                        sum(policy_losses) / len(policy_losses)))
 
             ##################################################
             ###            Immitation Learning             ###
@@ -307,6 +320,11 @@ class Module(nn.Module):
                 self.summary_writer.add_scalar('train/loss', sum_loss, epoch)
                 sum_loss = sum_loss.detach().cpu()
                 total_train_loss.append(float(sum_loss))
+
+            print("BC Epoch: {} Time: {:.0f} Loss: {:.2f}".format(
+                    epoch,
+                    time.time() - train_start_time,
+                    sum(total_train_loss) / len(total_train_loss)))
 
             ##################################################
             ###                 Validation                 ###
@@ -344,7 +362,7 @@ class Module(nn.Module):
                 sr_seen, plw_sr_seen, gc_seen, plw_gc_seen = count_results(valid_completed, True)
                 sr_unseen, plw_sr_unseen, gc_unseen, plw_gc_unseen = count_results(valid_completed, True)
                 valid_summary_list = [valid_epoch, valid_time - train_start_time, sr_seen, plw_sr_seen, gc_seen, 
-                                      plw_gc_seen, sr_unseen, plw_sr_unseen, gc_unseen, plw_gc_unseen,]
+                                      plw_gc_seen, sr_unseen, plw_sr_unseen, gc_unseen, plw_gc_unseen]
                 valid_summary_dict = {
                     'epoch': valid_epoch, 
                     'time': valid_time - train_start_time,
@@ -362,6 +380,11 @@ class Module(nn.Module):
                 with open(valid_results_csv, 'a') as f:
                     writer = csv.writer(f)
                     writer.writerow(valid_summary_list)
+                print()
+                print("Validation Epoch: {}-{} Time: {:.0f}-{:.0f}".format(valid_epoch, epoch, valid_time - train_start_time, time.time() - train_start_time))
+                print("\tsr_seen: {:.2f} plw_sr_seen: {:.2f} gc_seen: {:.2f} plw_gc_seen: {:.2f}".format(sr_seen, plw_sr_seen, gc_seen, plw_gc_seen))
+                print("\tsr_unseen: {:.2f} plw_sr_unseen: {:.2f} gc_unseen: {:.2f} plw_gc_unseen: {:.2f}".format(sr_unseen, plw_sr_unseen, gc_unseen, plw_gc_unseen))
+                print()
 
                 new_bests = []
                 new_bests.append('sr_seen' if best_results['sr_seen'] is None or sr_seen > best_results['sr_seen'] else None)
@@ -619,7 +642,7 @@ class Module(nn.Module):
         '''
         breaks dataset into batch_size chunks for training
         '''
-        for i in trange(0, len(data), batch_size, desc='batch'):
+        for i in range(0, len(data), batch_size):
             tasks = data[i:i+batch_size]
             batch = [self.load_task_json(task) for task in tasks]
             feat = self.featurize(batch)
@@ -691,7 +714,7 @@ class Module(nn.Module):
         env.step(dict(traj_data['scene']['init_action']))
 
         # print goal instr
-        print("Task: %s" % (traj_data['turk_annotations']['anns'][r_idx]['task_desc']))
+        # print("Task: %s" % (traj_data['turk_annotations']['anns'][r_idx]['task_desc']))
 
         # setup task for reward
         env.set_task(traj_data, args, reward_type=reward_type)

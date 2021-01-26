@@ -298,7 +298,7 @@ class Module(Base):
         cleaned_action_out[1] = 0
         cleaned_action_out[2] = 0
 
-        action_low_dist = nn.functional.softmax(cleaned_action_out)
+        action_low_dist = nn.functional.softmax(cleaned_action_out, dim=0)
         action_low_mask_dist = F.sigmoid(feat['out_action_low_mask'].squeeze())
         mask_shape = action_low_mask_dist.shape
         action_low_mask_dist = torch.stack([1 - action_low_mask_dist, action_low_mask_dist], dim=-1)
@@ -358,7 +358,7 @@ class Module(Base):
         losses['action_low'] = alow_loss * self.args.action_loss_wt
 
         # mask loss
-        valid_idxs = valid.view(-1).nonzero().view(-1)
+        valid_idxs = torch.nonzero(valid.view(-1)).squeeze(-1)
         flat_p_alow_mask = p_alow_mask.view(p_alow_mask.shape[0]*p_alow_mask.shape[1], *p_alow_mask.shape[2:])[valid_idxs]
         flat_alow_mask = torch.cat(feat['action_low_mask'], dim=0)
         alow_mask_loss = self.weighted_mask_loss(flat_p_alow_mask, flat_alow_mask)
