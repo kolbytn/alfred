@@ -287,7 +287,7 @@ class Module(Base):
         return pred
 
 
-    def sample_pred(self, feat):
+    def sample_pred(self, feat, greedy=False):
         '''
         output processing
         '''
@@ -303,13 +303,22 @@ class Module(Base):
         mask_shape = action_low_mask_dist.shape
         action_low_mask_dist = torch.stack([1 - action_low_mask_dist, action_low_mask_dist], dim=-1)
 
-        # sample actions
-        action_low_idx = torch.multinomial(action_low_dist, 1)
-        action_low_mask = torch.multinomial(action_low_mask_dist.view(-1, 2), 1).reshape(mask_shape)
+        if greedy:
+            # sample actions
+            action_low_idx = torch.argmax(action_low_dist).unsqueeze(0)
+            action_low_mask = torch.argmax(action_low_mask_dist, dim=2)
 
-        # calculate probabilities
-        action_low_prob = action_low_dist[action_low_idx]
-        action_low_mask_prob = torch.prod(torch.gather(action_low_mask_dist, -1, action_low_mask.unsqueeze(-1))).unsqueeze(0)
+            # calculate probabilities
+            action_low_prob = torch.FloatTensor([1])
+            action_low_mask_prob = torch.FloatTensor([1])
+        else:
+            # sample actions
+            action_low_idx = torch.multinomial(action_low_dist, 1)
+            action_low_mask = torch.multinomial(action_low_mask_dist.view(-1, 2), 1).reshape(mask_shape)
+
+            # calculate probabilities
+            action_low_prob = action_low_dist[action_low_idx]
+            action_low_mask_prob = torch.prod(torch.gather(action_low_mask_dist, -1, action_low_mask.unsqueeze(-1))).unsqueeze(0)
 
         # index to API actions
         word = self.vocab['action_low'].index2word(action_low_idx)

@@ -38,7 +38,7 @@ if __name__ == '__main__':
 
     # hyper parameters
     parser.add_argument('--batch', help='batch size', default=8, type=int)
-    parser.add_argument('--epoch', help='number of epochs', default=20, type=int)
+    parser.add_argument('--epoch', help='number of epochs', default=1000000, type=int)
     parser.add_argument('--lr', help='optimizer learning rate', default=1e-4, type=float)
     parser.add_argument('--decay_epoch', help='num epoch to adjust learning rate', default=10, type=int)
     parser.add_argument('--dhid', help='hidden layer size', default=512, type=int)
@@ -53,22 +53,20 @@ if __name__ == '__main__':
     # rl settings
     parser.add_argument('--reward_config', default='models/config/rewards.json')
     parser.add_argument('--smooth_nav', dest='smooth_nav', action='store_true', help='smooth nav actions (might be required based on training data)')
-    parser.add_argument('--num_rollout_processes', type=int, default=2, help='number of processes collecting rollouts')
-    parser.add_argument('--num_valid_processes', type=int, default=2, help='number of processes doing validation')
+    parser.add_argument('--num_rollout_processes', type=int, default=4, help='number of processes collecting rollouts')
+    parser.add_argument('--num_valid_processes', type=int, default=4, help='number of processes doing validation')
 
     # rl parameters
     parser.add_argument('--max_steps', type=int, default=100, help='max steps before episode termination')
     parser.add_argument('--max_fails', type=int, default=10, help='max API execution failures before episode termination')
-    parser.add_argument('--episodes_per_epoch', type=int, default=4, help='number of episodes to gather each epoch for reinforcement learning')
-    parser.add_argument('--batches_per_epoch', type=int, default=1, help='max number of immitation learning batches for each epoch')
-    parser.add_argument('--ppo_batch', type=int, default=2, help='number of rollouts in each ppo batch')
+    parser.add_argument('--episodes_per_epoch', type=int, default=32, help='number of episodes to gather each epoch for reinforcement learning')
+    parser.add_argument('--batches_per_epoch', type=int, default=32, help='max number of immitation learning batches for each epoch')
+    parser.add_argument('--ppo_batch', type=int, default=4, help='number of rollouts in each ppo batch')
     parser.add_argument('--gamma', type=float, default=0.99, help='return discount factor')
     parser.add_argument('--epsilon', type=float, default=0.2, help='PPO trust region parameter')
     parser.add_argument('--value_constant', type=float, default=1, help='PPO value loss scalar')
     parser.add_argument('--policy_constant', type=float, default=1, help='PPO policy loss scalar')
-    parser.add_argument('--ppo_epochs', type=int, default=5, help='number of epochs to run on PPO step')
-    parser.add_argument('--validation_frequency', type=int, default=10, help='frequency of doing validation during training')
-    parser.add_argument('--validation_episodes', type=int, default=20, help='number of episodes per validation')
+    parser.add_argument('--ppo_epochs', type=int, default=4, help='number of epochs to run on PPO step')
 
     # dropouts
     parser.add_argument('--zero_goal', help='zero out goal language', action='store_true')
@@ -88,6 +86,7 @@ if __name__ == '__main__':
     parser.add_argument('--debug', dest='debug', action='store_true')
     parser.add_argument('--small_train', help='fast epoch during debugging', action='store_true')
     parser.add_argument('--small_valid', help='fast valid during debugging', action='store_true')
+    parser.add_argument('--single_task', help='train and validate on a single task', action='store_true')
     parser.add_argument('--dataset_fraction', help='use fraction of the dataset for debugging (0 indicates full size)', default=0, type=int)
     parser.add_argument('--video_output_path', help='path for validation video files', default='data/validation_video/videos/', type=str)
     parser.add_argument('--video_fps', help='path for validation video fps', default=5, type=int)

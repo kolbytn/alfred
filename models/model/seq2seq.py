@@ -103,6 +103,11 @@ class Module(nn.Module):
             valid_seen = valid_seen[:8]
             valid_unseen = valid_unseen[:8]
 
+        if self.args.single_task:
+            train = [train[0]]
+            valid_seen = [train[0]]
+            valid_unseen = []
+
         # initialize summary writer for tensorboardX
         self.summary_writer = SummaryWriter(log_dir=self.args.dout)
 
@@ -186,7 +191,7 @@ class Module(nn.Module):
                 ############### Collect Rollouts #################
                 rollout_model.load_state_dict(self.state_dict())
                 
-                for traj in random.sample(train, self.args.episodes_per_epoch):
+                for traj in np.random.choice(train, self.args.episodes_per_epoch):
                     rollout_task_queue.put(traj)
 
                 total_rewards = []
@@ -293,38 +298,36 @@ class Module(nn.Module):
             ###            Immitation Learning             ###
             ##################################################
             self.train()
+            if self.args.batches_per_epoch > 0:
 
-            m_train = collections.defaultdict(list)
-            self.adjust_lr(optimizer, self.args.lr, epoch, decay_epoch=self.args.decay_epoch)
-            # p_train = {}
-            total_train_loss = list()
-            random.shuffle(train) # shuffle every epoch
-            sampled_train = train[:self.args.batch * self.args.batches_per_epoch] if self.args.batch * self.args.batches_per_epoch < len(train) else train
+                m_train = collections.defaultdict(list)
+                self.adjust_lr(optimizer, self.args.lr, epoch, decay_epoch=self.args.decay_epoch)
+                total_train_loss = list()
+                sampled_train = np.random.choice(train, self.args.batch * self.args.batches_per_epoch)
 
-            for batch, feat in self.iterate(sampled_train, self.args.batch):
-                out = self.forward(feat)
-                preds = self.extract_preds(out, batch, feat)
-                # p_train.update(preds)
-                loss = self.compute_loss(out, batch, feat)
-                for k, v in loss.items():
-                    ln = 'loss_' + k
-                    m_train[ln].append(v.item())
-                    self.summary_writer.add_scalar('train/' + ln, v.item(), epoch)
+                for batch, feat in self.iterate(sampled_train, self.args.batch):
+                    out = self.forward(feat)
+                    preds = self.extract_preds(out, batch, feat)
+                    loss = self.compute_loss(out, batch, feat)
+                    for k, v in loss.items():
+                        ln = 'loss_' + k
+                        m_train[ln].append(v.item())
+                        self.summary_writer.add_scalar('train/' + ln, v.item(), epoch)
 
-                # optimizer backward pass
-                optimizer.zero_grad()
-                sum_loss = sum(loss.values())
-                sum_loss.backward()
-                optimizer.step()
+                    # optimizer backward pass
+                    optimizer.zero_grad()
+                    sum_loss = sum(loss.values())
+                    sum_loss.backward()
+                    optimizer.step()
 
-                self.summary_writer.add_scalar('train/loss', sum_loss, epoch)
-                sum_loss = sum_loss.detach().cpu()
-                total_train_loss.append(float(sum_loss))
+                    self.summary_writer.add_scalar('train/loss', sum_loss, epoch)
+                    sum_loss = sum_loss.detach().cpu()
+                    total_train_loss.append(float(sum_loss))
 
-            print("BC Epoch: {} Time: {:.0f} Loss: {:.2f}".format(
-                    epoch,
-                    time.time() - train_start_time,
-                    sum(total_train_loss) / len(total_train_loss)))
+                print("BC Epoch: {} Time: {:.0f} Loss: {:.2f}".format(
+                        epoch,
+                        time.time() - train_start_time,
+                        sum(total_train_loss) / len(total_train_loss)))
 
             ##################################################
             ###                 Validation                 ###
@@ -353,16 +356,20 @@ class Module(nn.Module):
                             path_len_weighted_success_spl += log_result['path_len_weighted_success_spl']
                             path_len_weighted_goal_condition_spl += log_result['path_len_weighted_goal_condition_spl']
                             path_len_weight += log_result['path_len_weight']
-                    sr = successes / len(valid_seen) if seen else successes / len(valid_unseen)
-                    plw_sr = path_len_weighted_success_spl / path_len_weight
-                    gc = completed_goal_conditions / total_goal_conditions
-                    plw_gc = path_len_weighted_goal_condition_spl / path_len_weight
+                    if seen and len(valid_seen) > 0 or not seen and len(valid_unseen) > 0:
+                        sr = successes / len(valid_seen) if seen else successes / len(valid_unseen)
+                        plw_sr = path_len_weighted_success_spl / path_len_weight
+                        gc = completed_goal_conditions / total_goal_conditions
+                        plw_gc = path_len_weighted_goal_condition_spl / path_len_weight
+                    else:
+                        sr = -1
+                        plw_sr = -1
+                        gc = -1
+                        plw_gc = -1
                     return sr, plw_sr, gc, plw_gc
 
                 sr_seen, plw_sr_seen, gc_seen, plw_gc_seen = count_results(valid_completed, True)
-                sr_unseen, plw_sr_unseen, gc_unseen, plw_gc_unseen = count_results(valid_completed, True)
-                valid_summary_list = [valid_epoch, valid_time - train_start_time, sr_seen, plw_sr_seen, gc_seen, 
-                                      plw_gc_seen, sr_unseen, plw_sr_unseen, gc_unseen, plw_gc_unseen]
+                sr_unseen, plw_sr_unseen, gc_unseen, plw_gc_unseen = count_results(valid_completed, False)
                 valid_summary_dict = {
                     'epoch': valid_epoch, 
                     'time': valid_time - train_start_time,
@@ -375,6 +382,21 @@ class Module(nn.Module):
                     'gc_unseen': gc_unseen,
                     'plw_gc_unseen': plw_gc_unseen,
                 }
+
+                valid_summary_list = [valid_epoch, valid_time - train_start_time, sr_seen, plw_sr_seen, gc_seen, 
+                                      plw_gc_seen, sr_unseen, plw_sr_unseen, gc_unseen, plw_gc_unseen]
+                if self.args.episodes_per_epoch > 0:
+                    valid_summary_list += [
+                        sum(total_rewards) / len(total_rewards), 
+                        sum(value_losses) / len(value_losses), 
+                        sum(policy_losses) / len(policy_losses)
+                    ]
+                else:
+                    valid_summary_list += [None, None, None]
+                if self.args.batches_per_epoch > 0:
+                    valid_summary_list += [sum(total_train_loss) / len(total_train_loss)]
+                else:
+                    valid_summary_list += [None]
 
                 # Log results
                 with open(valid_results_csv, 'a') as f:
@@ -479,7 +501,7 @@ class Module(nn.Module):
 
                 # forward model
                 out = model.step(feat)
-                pred = model.sample_pred(out)
+                pred = model.sample_pred(out, greedy=validation)
 
                 # # check if <<stop>> was predicted
                 # if pred['action_low'] == "<<stop>>":
@@ -493,11 +515,10 @@ class Module(nn.Module):
                 # use predicted action and mask (if available) to interact with the env
                 t_success, _, _, err, _ = env.va_interact(action, interact_mask=mask, smooth_nav=args.smooth_nav, debug=args.debug)
 
-                # if not t_success:
-                #     fails += 1
-                #     if fails >= args.max_fails:
-                #         print("Interact API failed %d times" % fails + "; latest error '%s'" % err)
-                #         break
+                if not t_success:
+                    fails += 1
+                    if fails >= args.max_fails:
+                        break
 
                 # next time-step
                 reward, done = env.get_transition_reward()
