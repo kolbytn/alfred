@@ -66,7 +66,7 @@ class BaseTask(object):
         '''
         reward = 0
 
-        # goal completed
+        # goal completed: r=0
         if self.goal_finished:
             done = True
             return reward, done
@@ -75,7 +75,7 @@ class BaseTask(object):
         expert_plan = self.traj['plan']['high_pddl']
         action_type = expert_plan[self.goal_idx]['planner_action']['action']
 
-        # subgoal reward
+        # subgoal reward: r=1 for each subgoal
         if "dense" in self.reward_type:
             action = get_action(action_type, self.gt_graph, self.env, self.reward_config, self.strict)
             sg_reward, sg_done = action.get_reward(state, self.prev_state, expert_plan, self.goal_idx)

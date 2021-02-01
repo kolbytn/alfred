@@ -18,7 +18,7 @@ import csv
 from env.thor_env import ThorEnv
 from models.nn.resnet import Resnet
 from models.utils.video_record import VideoRecord
-
+from models.utils.resource_util import start_monitor, stop_monitor
 
 from multiprocessing import Process
 import subprocess
@@ -129,7 +129,7 @@ class Module(nn.Module):
             rollout_results = self.manager.Queue()
             rollout_processes = []
             for _ in range(self.args.num_rollout_processes):
-                p = mp.Process(target=Module.run_rollouts, args=(rollout_model, rollout_task_queue, rollout_results, self.args))
+                p = mp.Process(target=Module.run_rollouts, args=(rollout_model, rollout_task_queue, rollout_results, self.args, False))
                 p.start()
                 rollout_processes.append(p)
 
@@ -212,11 +212,16 @@ class Module(nn.Module):
 
                 for _ in range(self.args.ppo_epochs):
 
+                    
                     random.shuffle(completed_rollouts)
                     batch_idx = 0
                     while batch_idx < len(completed_rollouts):
 
                         ############### Prepare Batch #################
+
+                        # monitor resource usage
+                        monitor = start_monitor(path=self.args.dout, note=f"RL prep_batch epoch={_}")
+
                         if batch_idx + self.args.ppo_batch < len(completed_rollouts):
                             batch_rollouts = completed_rollouts[batch_idx:batch_idx+self.args.ppo_batch] 
                         else:
@@ -260,6 +265,8 @@ class Module(nn.Module):
                                 action_mask_idx[step_idx] = torch.from_numpy(step['action_mask_idx'])
 
                                 step_idx += 1
+                        
+                        stop_monitor(monitor)
 
                         ############### Update Policy ###############
                         optimizer.zero_grad()
@@ -267,6 +274,9 @@ class Module(nn.Module):
                         advantage = ret - out_value
                         value_loss = self.args.value_constant * torch.mean((ret - out_value) ** 2)
                         advantage.detach_()
+
+                        # monitor resource usage
+                        monitor = start_monitor(path=self.args.dout, note=f"RL calc_loss epoch={_}")
 
                         curr_prob = torch.log(curr_action_dist[range(curr_action_dist.shape[0]), action_idx.squeeze(1)].unsqueeze(1))
                         prev_prob = torch.log(prev_action_dist[range(prev_action_dist.shape[0]), action_idx.squeeze(1)].unsqueeze(1))
@@ -284,8 +294,15 @@ class Module(nn.Module):
                         policy_losses.append(policy_loss.item())
 
                         loss = value_loss + policy_loss
+
+                        stop_monitor(monitor)
+
+                        # monitor resource usage
+                        monitor = start_monitor(path=self.args.dout, note=f"RL policy_update epoch={_}")
                         loss.backward()
                         optimizer.step()
+
+                        stop_monitor(monitor)
 
                 print("PPO Epoch: {} Time: {:.0f} Reward: {:.2f} Value Loss: {:.2f} Polcy Loss: {:.2f}".format(
                         epoch,
@@ -299,6 +316,8 @@ class Module(nn.Module):
             ##################################################
             self.train()
             if self.args.batches_per_epoch > 0:
+                
+                
 
                 m_train = collections.defaultdict(list)
                 self.adjust_lr(optimizer, self.args.lr, epoch, decay_epoch=self.args.decay_epoch)
@@ -306,6 +325,9 @@ class Module(nn.Module):
                 sampled_train = np.random.choice(train, self.args.batch * self.args.batches_per_epoch)
 
                 for batch, feat in self.iterate(sampled_train, self.args.batch):
+                    # monitor resource usage
+                    monitor = start_monitor(path=self.args.dout, note=f"Imitation batch epoch={_}")
+
                     out = self.forward(feat)
                     preds = self.extract_preds(out, batch, feat)
                     loss = self.compute_loss(out, batch, feat)
@@ -324,6 +346,8 @@ class Module(nn.Module):
                     sum_loss = sum_loss.detach().cpu()
                     total_train_loss.append(float(sum_loss))
 
+                    stop_monitor(monitor)
+
                 print("BC Epoch: {} Time: {:.0f} Loss: {:.2f}".format(
                         epoch,
                         time.time() - train_start_time,
@@ -340,6 +364,9 @@ class Module(nn.Module):
                     break
 
             if len(valid_completed) == len(valid_seen) + len(valid_unseen):
+                # monitor resource usage
+                monitor = start_monitor(path=self.args.dout, note=f"Validation train epoch={_}")
+
                 # Count results
                 def count_results(results, seen):
                     successes = 0
@@ -382,6 +409,8 @@ class Module(nn.Module):
                     'gc_unseen': gc_unseen,
                     'plw_gc_unseen': plw_gc_unseen,
                 }
+
+                stop_monitor(monitor)
 
                 valid_summary_list = [valid_epoch, valid_time - train_start_time, sr_seen, plw_sr_seen, gc_seen, 
                                       plw_gc_seen, sr_unseen, plw_sr_unseen, gc_unseen, plw_gc_unseen]
@@ -433,6 +462,9 @@ class Module(nn.Module):
                     with open(fbest, 'wt') as f:
                         json.dump(valid_completed, f, indent=2)
                     best_results[filename] = valid_summary_dict[filename]
+                
+                # monitor resource usage
+                monitor = start_monitor(path=self.args.dout, note=f"Validation restart epoch={_}")
 
                 # Restart validation
                 valid_model.load_state_dict(self.state_dict())
@@ -443,6 +475,8 @@ class Module(nn.Module):
                 valid_completed = []
                 valid_time = time.time()
                 valid_epoch = epoch
+
+                stop_monitor(monitor)
 
             # Save the latest checkpoint
             if self.args.save_every_epoch:
@@ -465,6 +499,7 @@ class Module(nn.Module):
             p.join()
         for p in valid_processes:
             p.join()
+    
 
     @classmethod
     def run_rollouts(cls, model, task_queue, results, args, validation=False):
@@ -503,6 +538,10 @@ class Module(nn.Module):
                 out = model.step(feat)
                 pred = model.sample_pred(out, greedy=validation)
 
+                # monitor resource usage
+                monitor = start_monitor(path=args.dout, note="validation" if validation else "rollout" + f" step={num_steps}")
+
+
                 # # check if <<stop>> was predicted
                 # if pred['action_low'] == "<<stop>>":
                 #     print("\tpredicted STOP")
@@ -538,6 +577,8 @@ class Module(nn.Module):
                         'action_mask_idx': pred['action_low_mask_idx'].cpu().detach().numpy(),
                         'reward': np.array([reward])
                     })
+
+                stop_monitor(monitor)
 
             if validation:
                 # check if goal was satisfied
